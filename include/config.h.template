@@ -1,0 +1,26 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// WiFi Configuration
+// Leave empty to disable WiFi/NTP sync
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+
+// NTP Configuration
+#define NTP_SERVER "pool.ntp.org"
+
+// Timezone Configuration
+// Set your GMT offset in seconds
+// Examples:
+//   GMT+0  (UTC):           0
+//   GMT+1  (CET):           3600
+//   GMT+2  (EET):           7200
+//   GMT-5  (EST):          -18000
+//   GMT-8  (PST):          -28800
+#define BASE_GMT_OFFSET_SEC 0
+
+// Daylight Saving Time offset in seconds
+// Set to 3600 for regions with DST, 0 otherwise
+#define DST_OFFSET_SEC 0
+
+#endif
