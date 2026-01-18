@@ -1,0 +1,23 @@
+CompileFlags:
+  Remove:
+    - "-mlongcalls"
+    - "-mtext-section-literals"
+    - "-fstrict-volatile-bitfields"
+    - "-fno-tree-switch-conversion"
+    - "-free"
+    - "-fipa-pta"
+    - "-Wno-frame-address"
+    - "-Werror=*"
+    - "-march=*"
+    - "-mcpu=*"
+    - "-mabi=*"
+  Add:
+    - "--target=riscv32-esp-elf"
+    - "-std=gnu++17"
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None
+
+Index:
+  Background: Build
