@@ -28,24 +28,41 @@
 #define SCREEN_ADDRESS 0x3C
 
 // Configuration
-#define SLEEP_TIMEOUT 30000
 #define WIRE_SPEED 400000
 #define NTP_STALENESS_INTERVAL                                                 \
   86400 // 1 hour = 3600, 6 hours = 21600, 1 day = 86400,
 #define RAM_BUFFER_SIZE 48
 #define MAX_FLASH_ENTRIES 8760
-#define PERIODIC_WAKEUP_MINUTES 30
 #define ENCODER_DEBOUNCE_MS 5 // Faster debounce, but ISR only on CLK
 #define ENCODER_DETENTS_PER_CLICK                                              \
   2 // Not used in new ISR; keep for future tuning
+
+// Configurable sleep/wakeup options
+const uint32_t SLEEP_OPTIONS_MS[] = {15000, 30000, 60000, 120000, 300000};
+const char *SLEEP_LABELS[] = {"15s", "30s", "1m", "2m", "5m"};
+const int SLEEP_OPTIONS_COUNT = 5;
+
+const uint32_t WAKEUP_OPTIONS_MIN[] = {10, 15, 30, 60};
+const char *WAKEUP_LABELS[] = {"10m", "15m", "30m", "1h"};
+const int WAKEUP_OPTIONS_COUNT = 4;
+
+// Settings menu
+enum SettingsItem {
+  SET_DST,
+  SET_SLEEP,
+  SET_WAKEUP,
+  SET_NTP_SYNC,
+  SET_CLEAR_DATA,
+  SETTINGS_COUNT
+};
 
 // Display modes
 enum DisplayMode {
   MODE_OVERVIEW,
   MODE_HISTORY,
-  MODE_GRAPH_TEMP,
-  MODE_GRAPH_HUMID,
-  MODE_SETTINGS
+  MODE_GRAPH,
+  MODE_SETTINGS,
+  MODE_COUNT
 };
 
 // Time ranges for graphs
@@ -82,8 +99,10 @@ Preferences prefs;
 bool displayAvailable = false;
 bool sensorAvailable = false;
 
-// Settings
+// Settings (persisted)
 bool isSummerTime = false;
+int sleepTimeoutIdx = 1;   // index into SLEEP_OPTIONS_MS, default 30s
+int wakeupIntervalIdx = 2; // index into WAKEUP_OPTIONS_MIN, default 30min
 
 // RAM buffer (24h at 30min intervals)
 SensorData ramBuffer[RAM_BUFFER_SIZE];
@@ -118,6 +137,8 @@ TimeRange currentRange = RANGE_DAILY;
 int timeOffset = 0;
 int historyIndex = 0;
 int lastDisplayedPos = 0;
+bool graphShowTemp = true;
+int settingsIndex = 0;
 
 // ========== ISRs ==========
 
@@ -209,17 +230,33 @@ void loadSettings() {
   prefs.begin("settings", true);
   isSummerTime = prefs.getBool("summerTime", false);
   lastNtpSync = prefs.getULong("lastNtpSync", 0);
+  sleepTimeoutIdx = prefs.getInt("sleepIdx", 1);
+  wakeupIntervalIdx = prefs.getInt("wakeupIdx", 2);
   prefs.end();
-  Serial.printf("Settings loaded: DST=%s, LastSync=%lu\n",
-                isSummerTime ? "ON" : "OFF", lastNtpSync);
+
+  // Clamp indices to valid range
+  if (sleepTimeoutIdx < 0 || sleepTimeoutIdx >= SLEEP_OPTIONS_COUNT)
+    sleepTimeoutIdx = 1;
+  if (wakeupIntervalIdx < 0 || wakeupIntervalIdx >= WAKEUP_OPTIONS_COUNT)
+    wakeupIntervalIdx = 2;
+
+  Serial.printf("Settings loaded: DST=%s, Sleep=%s, Wakeup=%s\n",
+                isSummerTime ? "ON" : "OFF",
+                SLEEP_LABELS[sleepTimeoutIdx],
+                WAKEUP_LABELS[wakeupIntervalIdx]);
 }
 
 void saveSettings() {
   prefs.begin("settings", false);
   prefs.putBool("summerTime", isSummerTime);
   prefs.putULong("lastNtpSync", lastNtpSync);
+  prefs.putInt("sleepIdx", sleepTimeoutIdx);
+  prefs.putInt("wakeupIdx", wakeupIntervalIdx);
   prefs.end();
-  Serial.printf("Settings saved: DST=%s\n", isSummerTime ? "ON" : "OFF");
+  Serial.printf("Settings saved: DST=%s, Sleep=%s, Wakeup=%s\n",
+                isSummerTime ? "ON" : "OFF",
+                SLEEP_LABELS[sleepTimeoutIdx],
+                WAKEUP_LABELS[wakeupIntervalIdx]);
 }
 
 void initDisplay() {
@@ -593,19 +630,39 @@ void displaySettings() {
   display.clearDisplay();
   display.setTextSize(1);
 
+  // Header
   display.setCursor(0, 0);
-  display.print("=== SETTINGS ===");
+  display.print("SETTINGS");
 
-  display.setCursor(0, 20);
-  display.print("Summer Time (DST):");
+  // Menu items (5 items, 9px spacing, starting at y=11)
+  const int itemY[] = {11, 20, 29, 38, 47};
 
-  display.setTextSize(2);
-  display.setCursor(20, 35);
-  display.print(isSummerTime ? "ON" : "OFF");
+  for (int i = 0; i < SETTINGS_COUNT; i++) {
+    display.setCursor(0, itemY[i]);
+    display.print(i == settingsIndex ? ">" : " ");
 
-  display.setTextSize(1);
-  display.setCursor(0, 56);
-  display.print("Turn=Toggle Btn=Save");
+    switch (i) {
+    case SET_DST:
+      display.printf(" DST: %s", isSummerTime ? "ON" : "OFF");
+      break;
+    case SET_SLEEP:
+      display.printf(" Sleep: %s", SLEEP_LABELS[sleepTimeoutIdx]);
+      break;
+    case SET_WAKEUP:
+      display.printf(" Wakeup: %s", WAKEUP_LABELS[wakeupIntervalIdx]);
+      break;
+    case SET_NTP_SYNC:
+      display.print(" NTP Sync");
+      break;
+    case SET_CLEAR_DATA:
+      display.print(" Clear Data");
+      break;
+    }
+  }
+
+  // Footer hint
+  display.setCursor(0, 57);
+  display.print("Turn=Nav Ok=Act Hold=Save");
 
   display.display();
 }
@@ -811,7 +868,7 @@ void drawGraph(bool isTemperature) {
 
 void enterDeepSleep(bool periodicWakeup = false) {
   if (periodicWakeup) {
-    Serial.printf("Sleep %dmin\n", PERIODIC_WAKEUP_MINUTES);
+    Serial.printf("Sleep %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
     backgroundReading = true;
   } else {
     Serial.println("Sleep...");
@@ -835,11 +892,178 @@ void enterDeepSleep(bool periodicWakeup = false) {
   Wire.end();
 
   if (periodicWakeup) {
-    esp_sleep_enable_timer_wakeup(PERIODIC_WAKEUP_MINUTES * 60ULL * 1000000ULL);
+    esp_sleep_enable_timer_wakeup(WAKEUP_OPTIONS_MIN[wakeupIntervalIdx] * 60ULL * 1000000ULL);
   }
 
   setupWakeupSources();
   esp_deep_sleep_start();
+}
+
+// ========== Mode Handlers ==========
+
+void refreshDisplay() {
+  switch (currentMode) {
+  case MODE_OVERVIEW:
+    displayOverview();
+    break;
+  case MODE_HISTORY:
+    displayHistory();
+    break;
+  case MODE_GRAPH:
+    drawGraph(graphShowTemp);
+    break;
+  case MODE_SETTINGS:
+    displaySettings();
+    break;
+  }
+}
+
+void handleRotation(int delta) {
+  switch (currentMode) {
+  case MODE_OVERVIEW:
+    break;
+  case MODE_HISTORY:
+    historyIndex -= delta;
+    if (historyIndex < 0)
+      historyIndex = 0;
+    if (historyIndex >= (int)flashEntryCount)
+      historyIndex = flashEntryCount - 1;
+    Serial.printf("History: %d/%lu\n", historyIndex + 1, flashEntryCount);
+    break;
+  case MODE_GRAPH:
+    timeOffset -= delta;
+    if (timeOffset < 0)
+      timeOffset = 0;
+    if (timeOffset > 100)
+      timeOffset = 100;
+    Serial.printf("Graph offset: %d\n", timeOffset);
+    break;
+  case MODE_SETTINGS:
+    settingsIndex += delta;
+    if (settingsIndex < 0)
+      settingsIndex = SETTINGS_COUNT - 1;
+    if (settingsIndex >= SETTINGS_COUNT)
+      settingsIndex = 0;
+    break;
+  }
+  refreshDisplay();
+}
+
+void handleButtonPress() {
+  if (currentMode == MODE_SETTINGS) {
+    // Activate the selected settings item
+    switch (settingsIndex) {
+    case SET_DST:
+      isSummerTime = !isSummerTime;
+      Serial.printf("DST: %s\n", isSummerTime ? "ON" : "OFF");
+      break;
+    case SET_SLEEP:
+      sleepTimeoutIdx = (sleepTimeoutIdx + 1) % SLEEP_OPTIONS_COUNT;
+      Serial.printf("Sleep: %s\n", SLEEP_LABELS[sleepTimeoutIdx]);
+      break;
+    case SET_WAKEUP:
+      wakeupIntervalIdx = (wakeupIntervalIdx + 1) % WAKEUP_OPTIONS_COUNT;
+      Serial.printf("Wakeup: %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
+      break;
+    case SET_NTP_SYNC:
+      if (displayAvailable) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(10, 28);
+        display.print("Syncing NTP...");
+        display.display();
+      }
+      if (syncTimeWithNTP()) {
+        if (displayAvailable) {
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setCursor(20, 28);
+          display.print("NTP Sync OK!");
+          display.display();
+          delay(1000);
+        }
+      } else {
+        if (displayAvailable) {
+          display.clearDisplay();
+          display.setTextSize(1);
+          display.setCursor(10, 28);
+          display.print("NTP Sync Failed");
+          display.display();
+          delay(1000);
+        }
+      }
+      break;
+    case SET_CLEAR_DATA:
+      clearHistory();
+      if (displayAvailable) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(10, 28);
+        display.print("Data Cleared!");
+        display.display();
+        delay(800);
+      }
+      break;
+    }
+  } else {
+    currentMode = (DisplayMode)((currentMode + 1) % MODE_COUNT);
+
+    switch (currentMode) {
+    case MODE_OVERVIEW:
+      Serial.println("Mode: Overview");
+      break;
+    case MODE_HISTORY:
+      Serial.println("Mode: History");
+      historyIndex = flashEntryCount > 0 ? flashEntryCount - 1 : 0;
+      break;
+    case MODE_GRAPH:
+      Serial.println("Mode: Graph");
+      timeOffset = 0;
+      currentRange = RANGE_DAILY;
+      graphShowTemp = true;
+      break;
+    case MODE_SETTINGS:
+      Serial.println("Mode: Settings");
+      settingsIndex = 0;
+      break;
+    default:
+      break;
+    }
+  }
+  refreshDisplay();
+}
+
+void handleLongPress() {
+  switch (currentMode) {
+  case MODE_GRAPH:
+    if (currentRange == RANGE_YEARLY) {
+      currentRange = RANGE_DAILY;
+      graphShowTemp = !graphShowTemp;
+    } else {
+      currentRange = (TimeRange)(currentRange + 1);
+    }
+    timeOffset = 0;
+    Serial.printf("Graph: %s %s\n", graphShowTemp ? "Temp" : "Humid",
+                  (const char *[]){"Daily", "Weekly", "Monthly",
+                                   "Yearly"}[currentRange]);
+    break;
+  case MODE_SETTINGS:
+    saveSettings();
+    Serial.println("Settings saved");
+    if (displayAvailable) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(10, 28);
+      display.print("Settings Saved!");
+      display.display();
+      delay(500);
+    }
+    currentMode = MODE_OVERVIEW;
+    break;
+  default:
+    break;
+  }
+  refreshDisplay();
 }
 
 // ========== Setup ==========
@@ -889,9 +1113,38 @@ void setup() {
   // Load settings from flash
   loadSettings();
 
+  // Init I2C and display early for status messages
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(WIRE_SPEED);
+
+  setupEncoder();
+
+  if (!backgroundReading) {
+    initDisplay();
+  }
+
+  // WiFi/NTP sync with display status
   if (shouldSyncNtp()) {
+    if (displayAvailable) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.print("Connecting WiFi...");
+      display.setCursor(0, 12);
+      display.print(WIFI_SSID);
+      display.display();
+    }
     printWiFiStatus();
     bool ntpSuccess = syncTimeWithNTP();
+
+    if (displayAvailable) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 28);
+      display.print(ntpSuccess ? "NTP Sync OK!" : "NTP Sync Failed");
+      display.display();
+      delay(1000);
+    }
 
     // Only set compile time if never synced and NTP failed
     if (!ntpSuccess && lastNtpSync == 0) {
@@ -916,15 +1169,6 @@ void setup() {
 #endif
   }
 
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(WIRE_SPEED);
-
-  // New encoder setup
-  setupEncoder();
-
-  if (!backgroundReading) {
-    initDisplay();
-  }
   initSensor();
 
   loadRamBuffer();
@@ -950,159 +1194,56 @@ void setup() {
 // ========== Loop ==========
 
 void loop() {
-  // Long press: cycle time range (in graph modes)
   if (longPress) {
     longPress = false;
-
-    if (currentMode == MODE_GRAPH_TEMP || currentMode == MODE_GRAPH_HUMID) {
-      currentRange = (TimeRange)((currentRange + 1) % 4);
-      timeOffset = 0;
-
-      const char *rangeNames[] = {"Daily", "Weekly", "Monthly", "Yearly"};
-      Serial.printf("Range: %s\n", rangeNames[currentRange]);
-
-      drawGraph(currentMode == MODE_GRAPH_TEMP);
-    } else if (currentMode == MODE_SETTINGS) {
-      // Long press in settings clears cache
-      clearHistory();
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setCursor(10, 24);
-      display.print("Cache cleared");
-      display.display();
-      delay(800);
-      displaySettings();
-    }
-
+    handleLongPress();
     lastActivityTime = millis();
   }
 
-  // Button press: cycle modes OR save in settings
   if (buttonPressed) {
     buttonPressed = false;
-
-    if (currentMode == MODE_SETTINGS) {
-      // Save and exit settings
-      saveSettings();
-      Serial.println("Settings saved, exiting to overview");
-      currentMode = MODE_OVERVIEW;
-      displayOverview();
-    } else {
-      // Cycle through modes
-      currentMode = (DisplayMode)((currentMode + 1) % 5);
-
-      Serial.print("Mode: ");
-      switch (currentMode) {
-      case MODE_OVERVIEW:
-        Serial.println("Overview");
-        displayOverview();
-        break;
-      case MODE_HISTORY:
-        Serial.println("History");
-        historyIndex = flashEntryCount > 0 ? flashEntryCount - 1 : 0;
-        displayHistory();
-        break;
-      case MODE_GRAPH_TEMP:
-        Serial.println("Temperature Graph");
-        timeOffset = 0;
-        currentRange = RANGE_DAILY;
-        drawGraph(true);
-        break;
-      case MODE_GRAPH_HUMID:
-        Serial.println("Humidity Graph");
-        timeOffset = 0;
-        currentRange = RANGE_DAILY;
-        drawGraph(false);
-        break;
-      case MODE_SETTINGS:
-        Serial.println("Settings");
-        displaySettings();
-        break;
-      }
-    }
-
+    handleButtonPress();
     lastDisplayedPos = encoderPos;
     lastActivityTime = millis();
   }
 
-  // Encoder rotation: apply hysteresis using ENCODER_DETENTS_PER_CLICK
+  // Encoder rotation with hysteresis
   int ticksSnapshot;
   noInterrupts();
-  ticksSnapshot = encoderTicks; // copy volatile safely
+  ticksSnapshot = encoderTicks;
   interrupts();
 
   int deltaTicks = ticksSnapshot - lastProcessedTicks;
-
-  // Only act when we've moved at least ENCODER_DETENTS_PER_CLICK ticks
   if (abs(deltaTicks) >= ENCODER_DETENTS_PER_CLICK) {
-    int steps = deltaTicks / ENCODER_DETENTS_PER_CLICK; // integer division
-    lastProcessedTicks +=
-        steps * ENCODER_DETENTS_PER_CLICK; // consume those ticks
+    int steps = deltaTicks / ENCODER_DETENTS_PER_CLICK;
+    lastProcessedTicks += steps * ENCODER_DETENTS_PER_CLICK;
+    encoderPos += steps;
 
-    encoderPos += steps; // logical position in steps
-    int delta = steps;   // what UI cares about
-
-    // Debug: show filtered movement
     Serial.printf("[ENC] Ticks: %d, Steps: %+d, Pos: %d\n", ticksSnapshot,
                   steps, encoderPos);
 
-    switch (currentMode) {
-    case MODE_OVERVIEW:
-      // No scrolling in overview
-      break;
-
-    case MODE_HISTORY:
-      // Scroll through individual entries
-      historyIndex -= delta;
-      if (historyIndex < 0)
-        historyIndex = 0;
-      if (historyIndex >= (int)flashEntryCount)
-        historyIndex = flashEntryCount - 1;
-      Serial.printf("History: %d/%lu\n", historyIndex + 1, flashEntryCount);
-      displayHistory();
-      break;
-
-    case MODE_GRAPH_TEMP:
-    case MODE_GRAPH_HUMID:
-      // Scroll through time ranges
-      timeOffset -= delta;
-      if (timeOffset < 0)
-        timeOffset = 0;
-      if (timeOffset > 100)
-        timeOffset = 100;
-      Serial.printf("Graph offset: %d\n", timeOffset);
-      drawGraph(currentMode == MODE_GRAPH_TEMP);
-      break;
-
-    case MODE_SETTINGS:
-      // Toggle DST on any rotation
-      isSummerTime = !isSummerTime;
-      Serial.printf("DST toggled: %s\n", isSummerTime ? "ON" : "OFF");
-      displaySettings();
-      break;
-    }
-
+    handleRotation(steps);
     lastDisplayedPos = encoderPos;
     lastActivityTime = millis();
   }
 
-  // Live updates while awake in overview
+  // Live sensor + clock updates in overview mode
   if (currentMode == MODE_OVERVIEW) {
     unsigned long nowMs = millis();
-    if (nowMs - lastLiveUpdate > 5000) { // refresh sensor every 5s
+    if (nowMs - lastLiveUpdate > 5000) {
       if (readSensorLive(liveData)) {
         hasLiveData = true;
       }
       lastLiveUpdate = nowMs;
     }
-    if (nowMs - lastClockRedraw > 1000) { // redraw time every 1s
+    if (nowMs - lastClockRedraw > 1000) {
       displayOverview();
       lastClockRedraw = nowMs;
     }
   }
 
-  // Sleep timeout
-  if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
+  // Sleep after inactivity
+  if (millis() - lastActivityTime > SLEEP_OPTIONS_MS[sleepTimeoutIdx]) {
     enterDeepSleep(true);
   }
 
