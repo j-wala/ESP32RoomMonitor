@@ -122,7 +122,6 @@ volatile int encoderTicks = 0; // raw transitions from ISR
 volatile uint8_t lastEncoderState = 0;
 volatile bool buttonPressed = false;
 volatile bool longPress = false;
-volatile unsigned long lastButtonPress = 0;
 volatile unsigned long buttonPressStart = 0;
 volatile unsigned long lastEncoderTime = 0;
 unsigned long lastActivityTime = 0;
@@ -136,7 +135,6 @@ DisplayMode currentMode = MODE_OVERVIEW;
 TimeRange currentRange = RANGE_DAILY;
 int timeOffset = 0;
 int historyIndex = 0;
-int lastDisplayedPos = 0;
 bool graphShowTemp = true;
 int settingsIndex = 0;
 
@@ -180,10 +178,8 @@ void IRAM_ATTR buttonISR() {
     unsigned long pressDuration = now - buttonPressStart;
     if (pressDuration > 50 && pressDuration < 500) {
       buttonPressed = true;
-      lastButtonPress = now;
     } else if (pressDuration >= 500) {
       longPress = true;
-      lastButtonPress = now;
     }
   }
   lastActivityTime = now;
@@ -209,7 +205,6 @@ void setupEncoder() {
   encoderTicks = 0;
   encoderPos = 0;
   lastProcessedTicks = 0;
-  lastDisplayedPos = 0;
 
   // Only use CLK pin interrupt for rotation, FALLING edge
   attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), encoderISR, FALLING);
@@ -391,7 +386,6 @@ void loadRamBuffer() {
       file.read((uint8_t *)&ramBuffer[i], sizeof(SensorData));
     }
     newestTimestamp = ramBuffer[ramBufferCount - 1].timestamp;
-    oldestTimestamp = 0;
     file.seek(0);
     SensorData first;
     file.read((uint8_t *)&first, sizeof(SensorData));
@@ -866,6 +860,19 @@ void drawGraph(bool isTemperature) {
   display.display();
 }
 
+void showStatusMessage(const char *msg, int x = 10, int y = 28,
+                       int delayMs = 0) {
+  if (!displayAvailable)
+    return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(x, y);
+  display.print(msg);
+  display.display();
+  if (delayMs > 0)
+    delay(delayMs);
+}
+
 void enterDeepSleep(bool periodicWakeup = false) {
   if (periodicWakeup) {
     Serial.printf("Sleep %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
@@ -876,13 +883,8 @@ void enterDeepSleep(bool periodicWakeup = false) {
   }
   Serial.flush();
 
-  if (displayAvailable && !periodicWakeup) {
-    display.clearDisplay();
-    display.setCursor(30, 28);
-    display.setTextSize(1);
-    display.print("Sleeping...");
-    display.display();
-    delay(500);
+  if (!periodicWakeup) {
+    showStatusMessage("Sleeping...", 30, 28, 500);
   }
 
   if (displayAvailable) {
@@ -915,6 +917,8 @@ void refreshDisplay() {
   case MODE_SETTINGS:
     displaySettings();
     break;
+  default:
+    break;
   }
 }
 
@@ -945,6 +949,8 @@ void handleRotation(int delta) {
     if (settingsIndex >= SETTINGS_COUNT)
       settingsIndex = 0;
     break;
+  default:
+    break;
   }
   refreshDisplay();
 }
@@ -966,43 +972,16 @@ void handleButtonPress() {
       Serial.printf("Wakeup: %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
       break;
     case SET_NTP_SYNC:
-      if (displayAvailable) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setCursor(10, 28);
-        display.print("Syncing NTP...");
-        display.display();
-      }
+      showStatusMessage("Syncing NTP...");
       if (syncTimeWithNTP()) {
-        if (displayAvailable) {
-          display.clearDisplay();
-          display.setTextSize(1);
-          display.setCursor(20, 28);
-          display.print("NTP Sync OK!");
-          display.display();
-          delay(1000);
-        }
+        showStatusMessage("NTP Sync OK!", 20, 28, 1000);
       } else {
-        if (displayAvailable) {
-          display.clearDisplay();
-          display.setTextSize(1);
-          display.setCursor(10, 28);
-          display.print("NTP Sync Failed");
-          display.display();
-          delay(1000);
-        }
+        showStatusMessage("NTP Sync Failed", 10, 28, 1000);
       }
       break;
     case SET_CLEAR_DATA:
       clearHistory();
-      if (displayAvailable) {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setCursor(10, 28);
-        display.print("Data Cleared!");
-        display.display();
-        delay(800);
-      }
+      showStatusMessage("Data Cleared!", 10, 28, 800);
       break;
     }
   } else {
@@ -1050,14 +1029,7 @@ void handleLongPress() {
   case MODE_SETTINGS:
     saveSettings();
     Serial.println("Settings saved");
-    if (displayAvailable) {
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setCursor(10, 28);
-      display.print("Settings Saved!");
-      display.display();
-      delay(500);
-    }
+    showStatusMessage("Settings Saved!", 10, 28, 500);
     currentMode = MODE_OVERVIEW;
     break;
   default:
@@ -1137,15 +1109,8 @@ void setup() {
     printWiFiStatus();
     bool ntpSuccess = syncTimeWithNTP();
 
-    if (displayAvailable) {
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setCursor(0, 28);
-      display.print(ntpSuccess ? "NTP Sync OK!" : "NTP Sync Failed");
-      display.display();
-      delay(1000);
-    }
-
+    showStatusMessage(ntpSuccess ? "NTP Sync OK!" : "NTP Sync Failed", 0, 28,
+                      1000);
     // Only set compile time if never synced and NTP failed
     if (!ntpSuccess && lastNtpSync == 0) {
 #ifdef COMPILE_TIME
@@ -1203,7 +1168,6 @@ void loop() {
   if (buttonPressed) {
     buttonPressed = false;
     handleButtonPress();
-    lastDisplayedPos = encoderPos;
     lastActivityTime = millis();
   }
 
@@ -1223,7 +1187,6 @@ void loop() {
                   steps, encoderPos);
 
     handleRotation(steps);
-    lastDisplayedPos = encoderPos;
     lastActivityTime = millis();
   }
 
