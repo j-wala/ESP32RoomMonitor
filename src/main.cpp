@@ -1,6 +1,13 @@
 #include "config.h"
+
+// Fallback if config.h is older and doesn't define TZ_STRING
+#ifndef TZ_STRING
+#define TZ_STRING "UTC0"
+#endif
+
 #include "esp32-hal.h"
 #include "esp_sleep.h"
+#include "esp_wifi.h"
 #include "time.h"
 #include <Adafruit_BME280.h>
 #include <Adafruit_GFX.h>
@@ -12,7 +19,6 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <Wire.h>
-
 
 // Pin Definitions
 #define ENCODER_CLK_PIN GPIO_NUM_4
@@ -48,12 +54,22 @@ const int WAKEUP_OPTIONS_COUNT = 4;
 
 // Settings menu
 enum SettingsItem {
-  SET_DST,
+  SET_NTP_SYNC,
+  SET_MANUAL_TIME,
   SET_SLEEP,
   SET_WAKEUP,
-  SET_NTP_SYNC,
   SET_CLEAR_DATA,
   SETTINGS_COUNT
+};
+
+// Time-edit sub-fields
+enum TimeEditField {
+  TE_YEAR,
+  TE_MONTH,
+  TE_DAY,
+  TE_HOUR,
+  TE_MIN,
+  TE_FIELD_COUNT
 };
 
 // Display modes
@@ -100,7 +116,6 @@ bool displayAvailable = false;
 bool sensorAvailable = false;
 
 // Settings (persisted)
-bool isSummerTime = false;
 int sleepTimeoutIdx = 1;   // index into SLEEP_OPTIONS_MS, default 30s
 int wakeupIntervalIdx = 2; // index into WAKEUP_OPTIONS_MIN, default 30min
 
@@ -137,6 +152,12 @@ int timeOffset = 0;
 int historyIndex = 0;
 bool graphShowTemp = true;
 int settingsIndex = 0;
+int settingsScroll = 0;
+
+// Manual time-edit state
+bool inTimeEditMode = false;
+int timeEditField = TE_YEAR;
+struct tm timeEditBuf = {};
 
 // ========== ISRs ==========
 
@@ -213,17 +234,8 @@ void setupEncoder() {
 
 // ========== Time & Settings Helpers ==========
 
-time_t getLocalTime(time_t utc) {
-  int offset = BASE_GMT_OFFSET_SEC;
-  if (isSummerTime) {
-    offset += DST_OFFSET_SEC;
-  }
-  return utc + offset;
-}
-
 void loadSettings() {
   prefs.begin("settings", true);
-  isSummerTime = prefs.getBool("summerTime", false);
   lastNtpSync = prefs.getULong("lastNtpSync", 0);
   sleepTimeoutIdx = prefs.getInt("sleepIdx", 1);
   wakeupIntervalIdx = prefs.getInt("wakeupIdx", 2);
@@ -235,21 +247,18 @@ void loadSettings() {
   if (wakeupIntervalIdx < 0 || wakeupIntervalIdx >= WAKEUP_OPTIONS_COUNT)
     wakeupIntervalIdx = 2;
 
-  Serial.printf("Settings loaded: DST=%s, Sleep=%s, Wakeup=%s\n",
-                isSummerTime ? "ON" : "OFF",
+  Serial.printf("Settings loaded: TZ=%s, Sleep=%s, Wakeup=%s\n", TZ_STRING,
                 SLEEP_LABELS[sleepTimeoutIdx],
                 WAKEUP_LABELS[wakeupIntervalIdx]);
 }
 
 void saveSettings() {
   prefs.begin("settings", false);
-  prefs.putBool("summerTime", isSummerTime);
   prefs.putULong("lastNtpSync", lastNtpSync);
   prefs.putInt("sleepIdx", sleepTimeoutIdx);
   prefs.putInt("wakeupIdx", wakeupIntervalIdx);
   prefs.end();
-  Serial.printf("Settings saved: DST=%s, Sleep=%s, Wakeup=%s\n",
-                isSummerTime ? "ON" : "OFF",
+  Serial.printf("Settings saved: Sleep=%s, Wakeup=%s\n",
                 SLEEP_LABELS[sleepTimeoutIdx],
                 WAKEUP_LABELS[wakeupIntervalIdx]);
 }
@@ -278,28 +287,176 @@ void printWiFiStatus() {
   Serial.println("==================\n");
 }
 
+void logScanResults() {
+  Serial.println("Scanning 2.4 GHz networks...");
+  int n = WiFi.scanNetworks(false, true); // include hidden
+  if (n <= 0) {
+    Serial.println("  (no networks found)");
+    return;
+  }
+  Serial.printf("  Found %d networks:\n", n);
+  for (int i = 0; i < n && i < 15; i++) {
+    Serial.printf("  %2d: %-32s ch%2d %4d dBm  %s\n", i + 1,
+                  WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i),
+                  WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "secured");
+  }
+  WiFi.scanDelete();
+}
+
+// Map ESP-IDF wifi disconnect reason codes to short strings
+static const char *wifiDisconnectReason(uint8_t reason) {
+  switch (reason) {
+  case 1:
+    return "UNSPECIFIED";
+  case 2:
+    return "AUTH_EXPIRE";
+  case 3:
+    return "AUTH_LEAVE";
+  case 4:
+    return "ASSOC_EXPIRE";
+  case 5:
+    return "ASSOC_TOOMANY";
+  case 6:
+    return "NOT_AUTHED";
+  case 7:
+    return "NOT_ASSOCED";
+  case 8:
+    return "ASSOC_LEAVE";
+  case 9:
+    return "ASSOC_NOT_AUTHED";
+  case 13:
+    return "INVALID_IE";
+  case 14:
+    return "MIC_FAILURE";
+  case 15:
+    return "4WAY_HANDSHAKE_TIMEOUT (likely WRONG PASSWORD)";
+  case 16:
+    return "GROUP_KEY_UPDATE_TIMEOUT";
+  case 17:
+    return "IE_IN_4WAY_DIFFERS (encryption mismatch)";
+  case 18:
+    return "GROUP_CIPHER_INVALID";
+  case 19:
+    return "PAIRWISE_CIPHER_INVALID";
+  case 20:
+    return "AKMP_INVALID";
+  case 23:
+    return "IEEE_802_1X_AUTH_FAILED";
+  case 24:
+    return "CIPHER_SUITE_REJECTED";
+  case 200:
+    return "BEACON_TIMEOUT";
+  case 201:
+    return "NO_AP_FOUND";
+  case 202:
+    return "AUTH_FAIL";
+  case 203:
+    return "ASSOC_FAIL";
+  case 204:
+    return "HANDSHAKE_TIMEOUT (likely WRONG PASSWORD)";
+  case 205:
+    return "CONNECTION_FAIL";
+  case 206:
+    return "AP_TSF_RESET";
+  case 207:
+    return "ROAMING";
+  default:
+    return "UNKNOWN";
+  }
+}
+
 bool syncTimeWithNTP() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
-  delay(1000); // Give it a full second to clear
+  // ---- 1. Bring the radio up cleanly ----
+  // Order matters on ESP32-C3: driver must be STARTED before esp_wifi_set_*.
+  // WiFi.disconnect(true, ...) turns the radio OFF, which makes subsequent
+  // esp_wifi_* calls silently fail.
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  WiFi.mode(WIFI_STA); // starts the driver
+  delay(100);
 
-  // Force the radio to stay awake and at full power
-  WiFi.setSleep(false);
+  // Log disconnect reasons (helps diagnose auth/assoc failures)
+  WiFi.onEvent(
+      [](WiFiEvent_t event, WiFiEventInfo_t info) {
+        uint8_t reason = info.wifi_sta_disconnected.reason;
+        Serial.printf("[WiFi] Disconnect reason %u: %s\n", reason,
+                      wifiDisconnectReason(reason));
+      },
+      ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-  Serial.printf("Connecting to: %s\n", WIFI_SSID);
+  // ---- 2. Apply C3-friendly settings (now that driver is up) ----
+  // - Set EU country code so ch 12-13 are also scanned (default may be ch1-11).
+  // - Some APs reject Long-Range mode beacons. Force plain B/G/N.
+  // - C3 only supports HT20; avoid HT40 negotiation.
+  // - Max TX power for marginal links.
+  wifi_country_t country = {
+      .cc = "DE",
+      .schan = 1,
+      .nchan = 13,
+      .max_tx_power = 84, // 0.25 dBm units => 21 dBm
+      .policy = WIFI_COUNTRY_POLICY_MANUAL,
+  };
+  esp_wifi_set_country(&country);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
+                                         WIFI_PROTOCOL_11N);
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+  WiFi.setSleep(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
-  // Some C3 boards need the BSSID or a specific phase-in
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // ---- 3. Scan first to locate the AP on a specific channel/BSSID ----
+  // Use a longer dwell time (500ms/ch) so faint beacons are caught.
+  // This avoids AiMesh band-steering and tells us if the SSID is visible.
+  Serial.printf("Scanning for '%s'...\n", WIFI_SSID);
+  int n = WiFi.scanNetworks(false, true, false, 500); // sync, hidden, active, 500ms/ch
+  int targetIdx = -1;
+  int32_t bestRssi = -127;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > bestRssi) {
+      bestRssi = WiFi.RSSI(i);
+      targetIdx = i;
+    }
+  }
+
+  // Log nearby networks either way — useful diagnostic
+  Serial.printf("Found %d networks:\n", n);
+  for (int i = 0; i < n && i < 15; i++) {
+    Serial.printf("  %2d: %-32s ch%2d %4d dBm\n", i + 1,
+                  WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+  }
+
+  // ---- 4. Diagnostic: dump SSID + PSK byte-for-byte ----
+  // Detects accidental non-ASCII whitespace, BOM, trailing CR, etc.
+  Serial.printf("SSID len=%u: ", (unsigned)strlen(WIFI_SSID));
+  for (size_t i = 0; i < strlen(WIFI_SSID); i++)
+    Serial.printf("%02X ", (uint8_t)WIFI_SSID[i]);
+  Serial.println();
+  Serial.printf("PSK  len=%u: ", (unsigned)strlen(WIFI_PASSWORD));
+  for (size_t i = 0; i < strlen(WIFI_PASSWORD); i++)
+    Serial.printf("%02X ", (uint8_t)WIFI_PASSWORD[i]);
+  Serial.println();
+
+  // ---- 5. Connect ----
+  if (targetIdx >= 0) {
+    uint8_t *bssid = WiFi.BSSID(targetIdx);
+    int ch = WiFi.channel(targetIdx);
+    Serial.printf("Target on ch%d %d dBm %s - pinning channel+BSSID\n", ch,
+                  WiFi.RSSI(targetIdx), WiFi.BSSIDstr(targetIdx).c_str());
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, ch, bssid);
+  } else {
+    Serial.printf("'%s' NOT in scan results - trying blind connect\n",
+                  WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+  WiFi.scanDelete();
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
-
-    // If we hit Status 4, it's a hard fail. Try one reset.
-    if (WiFi.status() == 4 && attempts < 5) {
-      Serial.println("\nHard fail detected. Resetting radio...");
-      WiFi.disconnect();
+    if (WiFi.status() == WL_CONNECT_FAILED && attempts < 5) {
+      Serial.println("\nConnect failed. Bouncing...");
+      WiFi.disconnect(false); // don't turn radio off
       delay(500);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
@@ -308,15 +465,24 @@ bool syncTimeWithNTP() {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("\nFailed. Final Status: %d\n", WiFi.status());
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
     return false;
   }
 
-  Serial.println("\nConnected! Syncing NTP...");
-  configTime(0, 0, NTP_SERVER);
+  Serial.printf("\nConnected. IP=%s RSSI=%d dBm CH=%d\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+                WiFi.channel());
+
+  // ---- 5. NTP ----
+  Serial.println("Syncing NTP...");
+  configTzTime(TZ_STRING, NTP_SERVER);
 
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 10000)) {
     Serial.println("NTP Sync Failed");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
     return false;
   }
 
@@ -324,7 +490,6 @@ bool syncTimeWithNTP() {
   lastNtpSync = rtc.getEpoch();
   saveSettings();
 
-  // Clean up to save power
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   return true;
@@ -349,6 +514,101 @@ bool shouldSyncNtp() {
 }
 
 bool timeIsSane() { return rtc.getEpoch() >= 1767225600; }
+
+// ========== Manual Time-Edit Helpers ==========
+
+static int daysInMonth(int year1900, int mon0) {
+  static const int days[] = {31, 28, 31, 30, 31, 30,
+                             31, 31, 30, 31, 30, 31};
+  if (mon0 == 1) {
+    int y = year1900 + 1900;
+    bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+    return leap ? 29 : 28;
+  }
+  return days[mon0];
+}
+
+void enterTimeEditMode() {
+  time_t utc = rtc.getEpoch();
+  localtime_r(&utc, &timeEditBuf); // TZ env (set in setup) gives local time
+  timeEditBuf.tm_sec = 0;
+  // Clamp year to a sane range so the user starts somewhere reasonable
+  if (timeEditBuf.tm_year < 125)
+    timeEditBuf.tm_year = 125; // 2025
+  if (timeEditBuf.tm_year > 199)
+    timeEditBuf.tm_year = 199; // 2099
+  timeEditField = TE_YEAR;
+  inTimeEditMode = true;
+  Serial.println("Manual time edit: ENTER");
+}
+
+void adjustTimeEditField(int delta) {
+  switch (timeEditField) {
+  case TE_YEAR: {
+    int y = timeEditBuf.tm_year + delta;
+    if (y < 125)
+      y = 125; // 2025
+    if (y > 199)
+      y = 199; // 2099
+    timeEditBuf.tm_year = y;
+    int dim = daysInMonth(timeEditBuf.tm_year, timeEditBuf.tm_mon);
+    if (timeEditBuf.tm_mday > dim)
+      timeEditBuf.tm_mday = dim;
+    break;
+  }
+  case TE_MONTH: {
+    int m = timeEditBuf.tm_mon + delta;
+    while (m < 0)
+      m += 12;
+    m %= 12;
+    timeEditBuf.tm_mon = m;
+    int dim = daysInMonth(timeEditBuf.tm_year, m);
+    if (timeEditBuf.tm_mday > dim)
+      timeEditBuf.tm_mday = dim;
+    break;
+  }
+  case TE_DAY: {
+    int dim = daysInMonth(timeEditBuf.tm_year, timeEditBuf.tm_mon);
+    int d = timeEditBuf.tm_mday + delta;
+    while (d < 1)
+      d += dim;
+    d = ((d - 1) % dim) + 1;
+    timeEditBuf.tm_mday = d;
+    break;
+  }
+  case TE_HOUR: {
+    int h = timeEditBuf.tm_hour + delta;
+    while (h < 0)
+      h += 24;
+    h %= 24;
+    timeEditBuf.tm_hour = h;
+    break;
+  }
+  case TE_MIN: {
+    int mi = timeEditBuf.tm_min + delta;
+    while (mi < 0)
+      mi += 60;
+    mi %= 60;
+    timeEditBuf.tm_min = mi;
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+void saveTimeEdit() {
+  // The buffer holds the user-entered LOCAL time. mktime() interprets it
+  // according to the TZ env var (set in setup) and returns the UTC epoch,
+  // automatically applying DST rules from the POSIX TZ string.
+  timeEditBuf.tm_isdst = -1; // let mktime auto-detect DST for this date
+  time_t newUtc = mktime(&timeEditBuf);
+  rtc.setTime(newUtc);
+  // Mark as recently-set so we don't immediately overwrite via NTP next boot
+  lastNtpSync = newUtc;
+  saveSettings();
+  Serial.printf("Manual time set: UTC epoch = %ld\n", (long)newUtc);
+}
 
 void initSensor() {
   Serial.println("Initializing BME280...");
@@ -506,10 +766,10 @@ void displayOverview() {
 
   display.clearDisplay();
 
-  // Convert UTC to local time
-  time_t localTime = getLocalTime(rtc.getEpoch());
+  // Convert UTC to local time (TZ env handles DST automatically)
+  time_t utc = rtc.getEpoch();
   struct tm timeinfo;
-  localtime_r(&localTime, &timeinfo);
+  localtime_r(&utc, &timeinfo);
 
   // Top: Date and Time (local)
   display.setTextSize(1);
@@ -588,10 +848,10 @@ void displayHistory() {
   display.setCursor(0, 0);
   display.printf("[#%d/%d]", historyIndex + 1, totalEntries);
 
-  // Timestamp (convert UTC to local)
-  time_t localTime = getLocalTime(data.timestamp);
+  // Timestamp (convert UTC to local; TZ env handles DST)
+  time_t utc = data.timestamp;
   struct tm timeinfo;
-  localtime_r(&localTime, &timeinfo);
+  localtime_r(&utc, &timeinfo);
   char timeStr[20];
   strftime(timeStr, sizeof(timeStr), "%H:%M %d.%m.%y", &timeinfo);
 
@@ -628,16 +888,34 @@ void displaySettings() {
   display.setCursor(0, 0);
   display.print("SETTINGS");
 
-  // Menu items (5 items, 9px spacing, starting at y=11)
-  const int itemY[] = {11, 20, 29, 38, 47};
+  // Up to 5 visible items, 9px spacing starting at y=11
+  const int VISIBLE_ITEMS = 5;
+  const int itemY[VISIBLE_ITEMS] = {11, 20, 29, 38, 47};
 
-  for (int i = 0; i < SETTINGS_COUNT; i++) {
-    display.setCursor(0, itemY[i]);
+  // Adjust scroll window so the selected item is visible
+  if (settingsIndex < settingsScroll)
+    settingsScroll = settingsIndex;
+  if (settingsIndex >= settingsScroll + VISIBLE_ITEMS)
+    settingsScroll = settingsIndex - VISIBLE_ITEMS + 1;
+  if (settingsScroll < 0)
+    settingsScroll = 0;
+  if (settingsScroll > SETTINGS_COUNT - VISIBLE_ITEMS)
+    settingsScroll = max(0, SETTINGS_COUNT - VISIBLE_ITEMS);
+
+  for (int slot = 0; slot < VISIBLE_ITEMS; slot++) {
+    int i = settingsScroll + slot;
+    if (i >= SETTINGS_COUNT)
+      break;
+
+    display.setCursor(0, itemY[slot]);
     display.print(i == settingsIndex ? ">" : " ");
 
     switch (i) {
-    case SET_DST:
-      display.printf(" DST: %s", isSummerTime ? "ON" : "OFF");
+    case SET_NTP_SYNC:
+      display.print(" NTP Sync");
+      break;
+    case SET_MANUAL_TIME:
+      display.print(" Set Time");
       break;
     case SET_SLEEP:
       display.printf(" Sleep: %s", SLEEP_LABELS[sleepTimeoutIdx]);
@@ -645,18 +923,70 @@ void displaySettings() {
     case SET_WAKEUP:
       display.printf(" Wakeup: %s", WAKEUP_LABELS[wakeupIntervalIdx]);
       break;
-    case SET_NTP_SYNC:
-      display.print(" NTP Sync");
-      break;
     case SET_CLEAR_DATA:
       display.print(" Clear Data");
       break;
     }
   }
 
+  // Scroll indicators
+  if (settingsScroll > 0) {
+    display.setCursor(122, 11);
+    display.print((char)0x18); // up arrow
+  }
+  if (settingsScroll + VISIBLE_ITEMS < SETTINGS_COUNT) {
+    display.setCursor(122, 47);
+    display.print((char)0x19); // down arrow
+  }
+
   // Footer hint
   display.setCursor(0, 57);
   display.print("Turn=Nav Ok=Act Hold=Save");
+
+  display.display();
+}
+
+void displayTimeEdit() {
+  if (!displayAvailable)
+    return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print("SET LOCAL TIME");
+
+  // Format: YYYY-MM-DD HH:MM (16 chars). At size-1 (6px/char) = 96px wide.
+  // Start at x=4 so we have a comfortable margin.
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d",
+           timeEditBuf.tm_year + 1900, timeEditBuf.tm_mon + 1,
+           timeEditBuf.tm_mday, timeEditBuf.tm_hour, timeEditBuf.tm_min);
+  const int textY = 18;
+  const int textX = 4;
+  display.setCursor(textX, textY);
+  display.print(buf);
+
+  // Underline the selected field. Char positions in buf:
+  //   year   = 0..3   (4 chars)
+  //   month  = 5..6   (2 chars)
+  //   day    = 8..9   (2 chars)
+  //   hour   = 11..12 (2 chars)
+  //   minute = 14..15 (2 chars)
+  const int charW = 6;
+  const int fieldStartCol[TE_FIELD_COUNT] = {0, 5, 8, 11, 14};
+  const int fieldLenChars[TE_FIELD_COUNT] = {4, 2, 2, 2, 2};
+  int ux = textX + fieldStartCol[timeEditField] * charW;
+  int uw = fieldLenChars[timeEditField] * charW;
+  display.drawFastHLine(ux, textY + 9, uw, SSD1306_WHITE);
+
+  // Hints
+  display.setCursor(0, 38);
+  display.print("Turn: change");
+  display.setCursor(0, 47);
+  display.print("Press: next field");
+  display.setCursor(0, 56);
+  display.print("Hold: save & exit");
 
   display.display();
 }
@@ -892,7 +1222,6 @@ void enterDeepSleep(bool periodicWakeup = false) {
   }
 
   Wire.end();
-
   if (periodicWakeup) {
     esp_sleep_enable_timer_wakeup(WAKEUP_OPTIONS_MIN[wakeupIntervalIdx] * 60ULL * 1000000ULL);
   }
@@ -915,7 +1244,10 @@ void refreshDisplay() {
     drawGraph(graphShowTemp);
     break;
   case MODE_SETTINGS:
-    displaySettings();
+    if (inTimeEditMode)
+      displayTimeEdit();
+    else
+      displaySettings();
     break;
   default:
     break;
@@ -943,11 +1275,15 @@ void handleRotation(int delta) {
     Serial.printf("Graph offset: %d\n", timeOffset);
     break;
   case MODE_SETTINGS:
-    settingsIndex += delta;
-    if (settingsIndex < 0)
-      settingsIndex = SETTINGS_COUNT - 1;
-    if (settingsIndex >= SETTINGS_COUNT)
-      settingsIndex = 0;
+    if (inTimeEditMode) {
+      adjustTimeEditField(delta);
+    } else {
+      settingsIndex += delta;
+      if (settingsIndex < 0)
+        settingsIndex = SETTINGS_COUNT - 1;
+      if (settingsIndex >= SETTINGS_COUNT)
+        settingsIndex = 0;
+    }
     break;
   default:
     break;
@@ -956,12 +1292,26 @@ void handleRotation(int delta) {
 }
 
 void handleButtonPress() {
+  // While editing time, short press = next field
+  if (currentMode == MODE_SETTINGS && inTimeEditMode) {
+    timeEditField = (timeEditField + 1) % TE_FIELD_COUNT;
+    refreshDisplay();
+    return;
+  }
+
   if (currentMode == MODE_SETTINGS) {
     // Activate the selected settings item
     switch (settingsIndex) {
-    case SET_DST:
-      isSummerTime = !isSummerTime;
-      Serial.printf("DST: %s\n", isSummerTime ? "ON" : "OFF");
+    case SET_NTP_SYNC:
+      showStatusMessage("Syncing NTP...");
+      if (syncTimeWithNTP()) {
+        showStatusMessage("NTP Sync OK!", 20, 28, 1000);
+      } else {
+        showStatusMessage("NTP Sync Failed", 10, 28, 1000);
+      }
+      break;
+    case SET_MANUAL_TIME:
+      enterTimeEditMode();
       break;
     case SET_SLEEP:
       sleepTimeoutIdx = (sleepTimeoutIdx + 1) % SLEEP_OPTIONS_COUNT;
@@ -970,14 +1320,6 @@ void handleButtonPress() {
     case SET_WAKEUP:
       wakeupIntervalIdx = (wakeupIntervalIdx + 1) % WAKEUP_OPTIONS_COUNT;
       Serial.printf("Wakeup: %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
-      break;
-    case SET_NTP_SYNC:
-      showStatusMessage("Syncing NTP...");
-      if (syncTimeWithNTP()) {
-        showStatusMessage("NTP Sync OK!", 20, 28, 1000);
-      } else {
-        showStatusMessage("NTP Sync Failed", 10, 28, 1000);
-      }
       break;
     case SET_CLEAR_DATA:
       clearHistory();
@@ -1004,6 +1346,8 @@ void handleButtonPress() {
     case MODE_SETTINGS:
       Serial.println("Mode: Settings");
       settingsIndex = 0;
+      settingsScroll = 0;
+      inTimeEditMode = false;
       break;
     default:
       break;
@@ -1013,6 +1357,15 @@ void handleButtonPress() {
 }
 
 void handleLongPress() {
+  // While editing time, long press = save & exit edit (stay in settings)
+  if (currentMode == MODE_SETTINGS && inTimeEditMode) {
+    saveTimeEdit();
+    inTimeEditMode = false;
+    showStatusMessage("Time Saved!", 25, 28, 600);
+    refreshDisplay();
+    return;
+  }
+
   switch (currentMode) {
   case MODE_GRAPH:
     if (currentRange == RANGE_YEARLY) {
@@ -1048,6 +1401,11 @@ void setup() {
 #else
   delay(100);
 #endif
+
+  // Apply timezone from POSIX TZ string. All localtime_r() / mktime() calls
+  // and Arduino's getLocalTime() will use this to compute local time with DST.
+  setenv("TZ", TZ_STRING, 1);
+  tzset();
 
   Serial.println("\n============================");
   Serial.println("ESP32-C3 Room Monitor");

@@ -9,18 +9,16 @@
 // NTP Configuration
 #define NTP_SERVER "pool.ntp.org"
 
-// Timezone Configuration
-// Set your GMT offset in seconds
+// Timezone Configuration (POSIX TZ string - handles DST automatically!)
+// Format: stdOFFSETdst[OFFSET][,start[/time],end[/time]]
 // Examples:
-//   GMT+0  (UTC):           0
-//   GMT+1  (CET):           3600
-//   GMT+2  (EET):           7200
-//   GMT-5  (EST):          -18000
-//   GMT-8  (PST):          -28800
-#define BASE_GMT_OFFSET_SEC 0
-
-// Daylight Saving Time offset in seconds
-// Set to 3600 for regions with DST, 0 otherwise
-#define DST_OFFSET_SEC 0
+//   Germany (CET/CEST):   "CET-1CEST,M3.5.0,M10.5.0/3"
+//   UK (GMT/BST):         "GMT0BST,M3.5.0/1,M10.5.0"
+//   Europe (generic):     "CET-1CEST,M3.5.0/2,M10.5.0/3"
+//   US Eastern:           "EST5EDT,M3.2.0,M11.1.0"
+//   US Pacific:           "PST8PDT,M3.2.0,M11.1.0"
+//   Japan (no DST):       "JST-9"
+//   UTC:                  "UTC0"
+#define TZ_STRING "CET-1CEST,M3.5.0,M10.5.0/3"
 
 #endif
