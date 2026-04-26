@@ -1,17 +1,19 @@
 # ESP32-C3 Room Monitor with Deep Sleep
 
-A battery-powered room monitor that displays temperature, humidity, and pressure readings on an OLED screen. The device uses deep sleep to conserve battery and wakes up when the rotary encoder is pressed or rotated.
+A battery-powered room monitor that displays temperature, humidity, and pressure readings on an OLED screen. The device uses deep sleep to conserve battery and wakes up when any of the buttons or the rotary encoder is touched.
 
 ## Features
 
-- **Deep Sleep Mode**: Enters deep sleep after 30 seconds of inactivity to save battery
-- **Wake-up Sources**: GPIO wakeup from rotary encoder button press or rotation (ESP32-C3 compatible)
+- **Deep Sleep Mode**: Enters deep sleep after a configurable inactivity timeout (default 30 s)
+- **Wake-up Sources**: GPIO wakeup from rotary encoder (CLK/DT/SW) and the dedicated mode button
 - **Sensor Readings**: BME280 for temperature, humidity, and pressure
-- **OLED Display**: 128x64 SSD1306 display for data visualization
-- **Data Logging**: Stores up to 50 sensor readings in RTC memory (persistent across sleep)
-- **History View**: Scroll through logged readings using the rotary encoder
-- **Serial Debug**: Outputs sensor readings to serial monitor
-- **Time Sync**: Optional WiFi NTP sync or compile-time initialization
+- **OLED Display**: 128x64 SSD1306 display with a default overview page and a clock-centric page (slide animation on minute change)
+- **Data Logging**: Up to ~8760 sensor readings persisted to LittleFS (24 h working set in RAM)
+- **History View**: Nested under Settings -> History; scroll with the rotary encoder
+- **Graphs**: Encoder click cycles 8 combos (Temp/Humid x Daily/Weekly/Monthly/Yearly); rotation scrolls back in time
+- **Settings auto-save**: Sleep / Wakeup interval persist immediately when changed
+- **Confirm prompts**: NTP Sync and Clear Data ask first, with a 10 s countdown auto-cancel
+- **Time Sync**: WiFi NTP sync (configurable in `include/config.h`) with timezone-aware DST handling
 - **Manual Encoder**: Software-based rotary encoder reading (no PCNT hardware required)
 
 ## Hardware Requirements
@@ -19,29 +21,33 @@ A battery-powered room monitor that displays temperature, humidity, and pressure
 - ESP32-C3 Development Board
 - BME280 Temperature/Humidity/Pressure Sensor
 - SSD1306 OLED Display (128x64)
-- Rotary Encoder (with button)
+- Rotary Encoder (with built-in button)
+- Dedicated tactile push button (mode/wake)
 - Pull-up resistors for I2C (if not built-in)
 
 ## Pin Configuration
 
 ### I2C Bus (BME280 & SSD1306)
-- **SDA**: GPIO 8
-- **SCL**: GPIO 9
+- **SDA**: GPIO 6
+- **SCL**: GPIO 7
 
 ### Rotary Encoder
 - **CLK**: GPIO 4
 - **DT**: GPIO 3
 - **SW (Button)**: GPIO 2
 
-**Note**: All encoder pins use internal pull-up resistors.
+### Mode / Wake Button
+- **Switch**: GPIO 5 (active-low to GND)
+
+**Note**: All encoder and button pins use internal pull-up resistors.
 
 ## Wiring Diagram
 
 ```
 ESP32-C3          BME280 / SSD1306
 --------          -----------------
-GPIO 8 (SDA) ---> SDA
-GPIO 9 (SCL) ---> SCL
+GPIO 6 (SDA) ---> SDA
+GPIO 7 (SCL) ---> SCL
 3.3V         ---> VCC
 GND          ---> GND
 
@@ -51,6 +57,11 @@ GPIO 4       ---> CLK
 GPIO 3       ---> DT
 GPIO 2       ---> SW (Button)
 GND          ---> GND (common)
+
+ESP32-C3          Mode Button
+--------          -----------
+GPIO 5       ---> one terminal
+GND          ---> other terminal
 ```
 
 ## I2C Addresses
@@ -68,49 +79,54 @@ if (!bme.begin(0x77, &Wire)) {  // Change from 0x76 to 0x77
 ### Initial Power-On
 1. Device initializes display and sensor
 2. Takes first sensor reading
-3. Displays current reading
-4. After 30 seconds of inactivity, enters deep sleep with periodic wake-up enabled
+3. Displays the default overview page
+4. After the configured inactivity timeout (default 30 s) it enters deep sleep with periodic wake-up enabled
 
 ### Wake-Up Behavior
-- **Encoder Button Press**: Wakes device and cycles through display modes
-- **Encoder Rotation**: Scrolls through history entries (only in History mode)
-- **Timer Wake-Up (automatic)**: Every 15 minutes, device wakes up, reads sensor in background (display stays off), and goes back to sleep
+- **Mode button (GPIO 5)**: Wakes the device; short press cycles top-level modes; long press forces sleep
+- **Encoder click**: Wakes the device; in mode = context action (see below)
+- **Encoder rotation**: Wakes the device; in mode = context navigation
+- **Timer wake-up**: Every `Wakeup` interval (default 30 min) the device wakes silently, takes a reading, and returns to sleep
 
-### Display Modes (Cycle with Button Press)
+### Top-level modes (cycled by the mode button)
 
-#### 1. Current Reading Mode
-Shows:
-- Current time
-- Temperature: `T: 23.4C`
-- Humidity: `H: 45%`
-- Pressure: `P: 1013hPa`
-- Total log count
+`Overview -> Graph -> Settings -> Overview ...`
 
-#### 2. History Mode
-Shows:
-- Entry indicator: `[#5/20]`
-- Timestamp of entry
-- Temperature, humidity, pressure from that reading
-- **Rotate encoder** to scroll through entries
+#### 1. Overview
+Two pages, switched by **rotating the encoder**:
 
-#### 3. Temperature Graph Mode
-Shows:
-- Graph title: "Temp History"
-- Line chart of temperature readings over time
-- Min/max values on Y-axis
-- Shows up to 120 most recent data points
+- **Default page**: large temperature, date / time on top, humidity / pressure on the bottom row.
+- **Clock page**: large `HH:MM` with a slide animation when the minute changes; date on top, `T:xx.xC  H:yy%` on the bottom row.
 
-#### 4. Humidity Graph Mode
-Shows:
-- Graph title: "Humid History"
-- Line chart of humidity readings over time
-- Min/max values on Y-axis
-- Shows up to 120 most recent data points
+#### 2. Graph
+Line chart of temperature or humidity over time.
 
-### Controls
-- **Button Press**: Cycle through display modes (Current → History → Temp Graph → Humid Graph → Current...)
-- **Rotate Encoder**: Scroll through history entries (only works in History mode)
-- **No Interaction**: After 30 seconds, enters deep sleep with 15-minute periodic wake-up timer
+- **Encoder click**: cycles all 8 combos `Temp Day -> Temp Week -> Temp Month -> Temp Year -> Humid Day -> ... -> Humid Year -> wrap` (resets time offset).
+- **Encoder rotate**: scrolls the time window backwards (`(-1d)`, `(-2d)`, etc., units depend on range).
+
+#### 3. Settings
+Six items, navigated with the encoder, activated with an encoder click:
+
+- **NTP Sync** -- opens a confirm prompt before launching the WiFi attempt.
+- **Set Time** -- enters the manual time-edit sub-mode (turn = change field, click = next field, encoder long-press = save & exit).
+- **Sleep** -- click cycles `15s / 30s / 1m / 2m / 5m`; auto-saved.
+- **Wakeup** -- click cycles `10m / 15m / 30m / 1h`; auto-saved.
+- **History** -- nested entry browser (turn to scroll, encoder click to exit).
+- **Clear Data** -- opens a confirm prompt before wiping flash history.
+
+### Confirm prompts
+
+NTP Sync and Clear Data prompt with `Yes=Click  No=Mode` and a 10 s countdown bar. If the timer hits zero with no input, the prompt cancels itself.
+
+### Controls summary
+
+| Surface | Short press | Long press | Rotate |
+|---|---|---|---|
+| **Mode button (GPIO 5)** | Cycle top-level mode | Force deep sleep | -- |
+| **Encoder click** | Context action (see modes) | Save in time-edit only | -- |
+| **Encoder rotate** | Context navigation | -- | -- |
+
+- **No interaction**: After the configured inactivity timeout, enters deep sleep with a periodic wake-up timer armed.
 
 ## Configuration Options
 

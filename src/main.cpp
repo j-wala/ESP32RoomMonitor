@@ -24,6 +24,7 @@
 #define ENCODER_CLK_PIN GPIO_NUM_4
 #define ENCODER_DT_PIN GPIO_NUM_3
 #define ENCODER_SW_PIN GPIO_NUM_2
+#define MODE_BUTTON_PIN GPIO_NUM_5
 #define I2C_SDA_PIN 6
 #define I2C_SCL_PIN 7
 
@@ -42,6 +43,7 @@
 #define ENCODER_DEBOUNCE_MS 5 // Faster debounce, but ISR only on CLK
 #define ENCODER_DETENTS_PER_CLICK                                              \
   2 // Not used in new ISR; keep for future tuning
+#define CONFIRM_TIMEOUT_MS 10000 // Auto-cancel destructive prompts after 10 s
 
 // Configurable sleep/wakeup options
 const uint32_t SLEEP_OPTIONS_MS[] = {15000, 30000, 60000, 120000, 300000};
@@ -52,12 +54,13 @@ const uint32_t WAKEUP_OPTIONS_MIN[] = {10, 15, 30, 60};
 const char *WAKEUP_LABELS[] = {"10m", "15m", "30m", "1h"};
 const int WAKEUP_OPTIONS_COUNT = 4;
 
-// Settings menu
+// Settings menu (History is nested here now; Clear Data stays last)
 enum SettingsItem {
   SET_NTP_SYNC,
   SET_MANUAL_TIME,
   SET_SLEEP,
   SET_WAKEUP,
+  SET_HISTORY,
   SET_CLEAR_DATA,
   SETTINGS_COUNT
 };
@@ -72,13 +75,26 @@ enum TimeEditField {
   TE_FIELD_COUNT
 };
 
-// Display modes
+// Display modes (top-level, cycled by the dedicated mode button on GPIO 5)
 enum DisplayMode {
   MODE_OVERVIEW,
-  MODE_HISTORY,
   MODE_GRAPH,
   MODE_SETTINGS,
   MODE_COUNT
+};
+
+// Overview sub-pages (toggled by encoder rotation while in MODE_OVERVIEW)
+enum OverviewPage {
+  OV_DEFAULT,
+  OV_CLOCK,
+  OV_PAGE_COUNT
+};
+
+// Pending destructive/expensive action awaiting Yes/No confirmation
+enum ConfirmAction {
+  CONFIRM_NONE,
+  CONFIRM_NTP_SYNC,
+  CONFIRM_CLEAR_DATA
 };
 
 // Time ranges for graphs
@@ -141,12 +157,18 @@ volatile unsigned long buttonPressStart = 0;
 volatile unsigned long lastEncoderTime = 0;
 unsigned long lastActivityTime = 0;
 
+// Mode button (separate from encoder click): cycles top mode + force sleep
+volatile bool modeButtonPressed = false;
+volatile bool modeLongPress = false;
+volatile unsigned long modeButtonPressStart = 0;
+
 // Filtered encoder state (in detent steps)
 int encoderPos = 0; // logical position in steps
 int lastProcessedTicks = 0;
 
 // UI state
 DisplayMode currentMode = MODE_OVERVIEW;
+OverviewPage currentOverviewPage = OV_DEFAULT;
 TimeRange currentRange = RANGE_DAILY;
 int timeOffset = 0;
 int historyIndex = 0;
@@ -158,6 +180,19 @@ int settingsScroll = 0;
 bool inTimeEditMode = false;
 int timeEditField = TE_YEAR;
 struct tm timeEditBuf = {};
+
+// History sub-view (nested under Settings -> History)
+bool inHistoryView = false;
+
+// Confirmation prompt state (NTP sync / Clear data)
+ConfirmAction pendingConfirm = CONFIRM_NONE;
+unsigned long confirmEnterMs = 0;
+unsigned long lastConfirmRedraw = 0;
+
+// Clock overview slide-on-minute-change state
+int prevMinute = -1;
+unsigned long minuteSlideStart = 0;
+bool minuteSliding = false;
 
 // ========== ISRs ==========
 
@@ -206,12 +241,29 @@ void IRAM_ATTR buttonISR() {
   lastActivityTime = now;
 }
 
+void IRAM_ATTR modeButtonISR() {
+  unsigned long now = millis();
+
+  if (digitalRead(MODE_BUTTON_PIN) == LOW) {
+    modeButtonPressStart = now;
+  } else {
+    unsigned long pressDuration = now - modeButtonPressStart;
+    if (pressDuration > 50 && pressDuration < 500) {
+      modeButtonPressed = true;
+    } else if (pressDuration >= 500) {
+      modeLongPress = true;
+    }
+  }
+  lastActivityTime = now;
+}
+
 // ========== Hardware Initialization ==========
 
 void setupWakeupSources() {
   esp_deep_sleep_enable_gpio_wakeup((1ULL << ENCODER_SW_PIN) |
                                         (1ULL << ENCODER_CLK_PIN) |
-                                        (1ULL << ENCODER_DT_PIN),
+                                        (1ULL << ENCODER_DT_PIN) |
+                                        (1ULL << MODE_BUTTON_PIN),
                                     ESP_GPIO_WAKEUP_GPIO_LOW);
 }
 
@@ -219,6 +271,7 @@ void setupEncoder() {
   pinMode(ENCODER_SW_PIN, INPUT_PULLUP);
   pinMode(ENCODER_CLK_PIN, INPUT_PULLUP);
   pinMode(ENCODER_DT_PIN, INPUT_PULLUP);
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
 
   // Initial state
   lastEncoderState =
@@ -230,6 +283,8 @@ void setupEncoder() {
   // Only use CLK pin interrupt for rotation, FALLING edge
   attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), encoderISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(ENCODER_SW_PIN), buttonISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(MODE_BUTTON_PIN), modeButtonISR,
+                  CHANGE);
 }
 
 // ========== Time & Settings Helpers ==========
@@ -418,7 +473,7 @@ bool syncTimeWithNTP() {
     }
   }
 
-  // Log nearby networks either way — useful diagnostic
+  // Log nearby networks either way - useful diagnostic
   Serial.printf("Found %d networks:\n", n);
   for (int i = 0; i < n && i < 15; i++) {
     Serial.printf("  %2d: %-32s ch%2d %4d dBm\n", i + 1,
@@ -758,7 +813,7 @@ void clearHistory() {
 
 // ========== Display Functions ==========
 
-void displayOverview() {
+void displayOverviewDefault() {
   if (!displayAvailable || ramBufferCount == 0)
     return;
 
@@ -820,6 +875,131 @@ void displayOverview() {
   display.display();
 }
 
+// Helper: draw a single size-4 character (24 wide x 32 tall cell) at (x, y).
+static void drawClockChar(int x, int y, char c) {
+  display.setTextSize(4);
+  display.setCursor(x, y);
+  display.write(c);
+}
+
+// Big clock with minute slide-flip animation, date on top, T/H on bottom.
+void displayOverviewClock() {
+  if (!displayAvailable)
+    return;
+
+  SensorData fallback = {0};
+  SensorData &data = hasLiveData
+                         ? liveData
+                         : (ramBufferCount > 0 ? ramBuffer[ramBufferCount - 1]
+                                               : fallback);
+
+  time_t utc = rtc.getEpoch();
+  struct tm timeinfo;
+  localtime_r(&utc, &timeinfo);
+
+  // Detect minute change and arm the slide animation.
+  if (prevMinute < 0) {
+    prevMinute = timeinfo.tm_min;
+  } else if (timeinfo.tm_min != prevMinute && !minuteSliding) {
+    minuteSliding = true;
+    minuteSlideStart = millis();
+  }
+
+  // Compute slide progress (0..1). When done, latch new minute.
+  const unsigned long SLIDE_MS = 250;
+  float progress = 0.0f;
+  bool sliding = false;
+  if (minuteSliding) {
+    unsigned long elapsed = millis() - minuteSlideStart;
+    if (elapsed >= SLIDE_MS) {
+      minuteSliding = false;
+      prevMinute = timeinfo.tm_min;
+    } else {
+      progress = (float)elapsed / (float)SLIDE_MS;
+      sliding = true;
+    }
+  }
+
+  display.clearDisplay();
+
+  // ---- Big HH:MM band ----
+  // 5 cells of 24 px = 120 px wide, x_start = 4. Band y = 16..47 (32 tall).
+  const int CLOCK_Y = 16;
+  const int DIGIT_W = 24;
+  const int CLOCK_X = 4;
+  const int DIGIT_H = 32;
+
+  int hh = timeinfo.tm_hour;
+  int curMin = timeinfo.tm_min;
+  int oldMin = (prevMinute >= 0) ? prevMinute : curMin;
+
+  // Hours (static)
+  drawClockChar(CLOCK_X + 0 * DIGIT_W, CLOCK_Y, '0' + (hh / 10));
+  drawClockChar(CLOCK_X + 1 * DIGIT_W, CLOCK_Y, '0' + (hh % 10));
+
+  // Colon (blink at 1 Hz; always on while sliding for steadier reading)
+  bool colonOn = sliding || ((millis() / 500) % 2 == 0);
+  if (colonOn) {
+    drawClockChar(CLOCK_X + 2 * DIGIT_W, CLOCK_Y, ':');
+  }
+
+  // Minutes
+  if (sliding) {
+    int oldOff = -(int)(progress * DIGIT_H); // old slides up off the band
+    int newOff = (int)((1.0f - progress) * DIGIT_H); // new slides up into band
+    drawClockChar(CLOCK_X + 3 * DIGIT_W, CLOCK_Y + oldOff, '0' + (oldMin / 10));
+    drawClockChar(CLOCK_X + 4 * DIGIT_W, CLOCK_Y + oldOff, '0' + (oldMin % 10));
+    drawClockChar(CLOCK_X + 3 * DIGIT_W, CLOCK_Y + newOff, '0' + (curMin / 10));
+    drawClockChar(CLOCK_X + 4 * DIGIT_W, CLOCK_Y + newOff, '0' + (curMin % 10));
+  } else {
+    drawClockChar(CLOCK_X + 3 * DIGIT_W, CLOCK_Y, '0' + (curMin / 10));
+    drawClockChar(CLOCK_X + 4 * DIGIT_W, CLOCK_Y, '0' + (curMin % 10));
+  }
+
+  // Mask digit overflow above and below the clock band so the date row and
+  // T/H row stay clean during the slide animation.
+  display.fillRect(0, 0, SCREEN_WIDTH, CLOCK_Y, SSD1306_BLACK);
+  display.fillRect(0, CLOCK_Y + DIGIT_H, SCREEN_WIDTH,
+                   SCREEN_HEIGHT - (CLOCK_Y + DIGIT_H), SSD1306_BLACK);
+
+  // ---- Date row (top) ----
+  display.setTextSize(1);
+  char dateStr[20];
+  strftime(dateStr, sizeof(dateStr), "%a %d.%m.%y", &timeinfo);
+  int dateW = (int)strlen(dateStr) * 6;
+  int dateX = (SCREEN_WIDTH - dateW) / 2;
+  if (dateX < 0)
+    dateX = 0;
+  display.setCursor(dateX, 4);
+  display.print(dateStr);
+
+  // ---- T/H row (bottom) ----
+  char thStr[24];
+  if (hasLiveData || ramBufferCount > 0) {
+    snprintf(thStr, sizeof(thStr), "T:%.1fC  H:%.0f%%", data.temperature,
+             data.humidity);
+  } else {
+    snprintf(thStr, sizeof(thStr), "no data");
+  }
+  int thW = (int)strlen(thStr) * 6;
+  int thX = (SCREEN_WIDTH - thW) / 2;
+  if (thX < 0)
+    thX = 0;
+  display.setCursor(thX, 56);
+  display.print(thStr);
+
+  display.display();
+}
+
+// Dispatcher: pick the active overview sub-page.
+void displayOverview() {
+  if (currentOverviewPage == OV_CLOCK) {
+    displayOverviewClock();
+  } else {
+    displayOverviewDefault();
+  }
+}
+
 void displayHistory() {
   if (!displayAvailable)
     return;
@@ -844,9 +1024,9 @@ void displayHistory() {
   display.clearDisplay();
   display.setTextSize(1);
 
-  // Header
+  // Header (annotate as nested under Settings -> History)
   display.setCursor(0, 0);
-  display.printf("[#%d/%d]", historyIndex + 1, totalEntries);
+  display.printf("[#%d/%d] History", historyIndex + 1, totalEntries);
 
   // Timestamp (convert UTC to local; TZ env handles DST)
   time_t utc = data.timestamp;
@@ -923,6 +1103,9 @@ void displaySettings() {
     case SET_WAKEUP:
       display.printf(" Wakeup: %s", WAKEUP_LABELS[wakeupIntervalIdx]);
       break;
+    case SET_HISTORY:
+      display.print(" History");
+      break;
     case SET_CLEAR_DATA:
       display.print(" Clear Data");
       break;
@@ -939,9 +1122,79 @@ void displaySettings() {
     display.print((char)0x19); // down arrow
   }
 
-  // Footer hint
+  // Footer hint (settings auto-save; no Hold-to-save anymore)
   display.setCursor(0, 57);
-  display.print("Turn=Nav Ok=Act Hold=Save");
+  display.print("Turn=Nav  Click=Pick");
+
+  display.display();
+}
+
+// Yes/No confirmation prompt for destructive/expensive actions.
+// Encoder click = Yes, mode button = No, auto-cancel after CONFIRM_TIMEOUT_MS.
+void displayConfirm() {
+  if (!displayAvailable)
+    return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+
+  // Header centered
+  const char *title = "CONFIRM";
+  int titleW = (int)strlen(title) * 6;
+  display.setCursor((SCREEN_WIDTH - titleW) / 2, 0);
+  display.print(title);
+
+  // Question (two lines)
+  const char *line1 = "";
+  const char *line2 = "";
+  switch (pendingConfirm) {
+  case CONFIRM_CLEAR_DATA:
+    line1 = "Clear all logged";
+    line2 = "data? Cannot undo.";
+    break;
+  case CONFIRM_NTP_SYNC:
+    line1 = "Sync time via WiFi?";
+    line2 = "Takes ~10s.";
+    break;
+  default:
+    line1 = "Are you sure?";
+    line2 = "";
+    break;
+  }
+  int l1W = (int)strlen(line1) * 6;
+  int l2W = (int)strlen(line2) * 6;
+  display.setCursor((SCREEN_WIDTH - l1W) / 2, 18);
+  display.print(line1);
+  display.setCursor((SCREEN_WIDTH - l2W) / 2, 30);
+  display.print(line2);
+
+  // Hint row
+  const char *hint = "Yes=Click  No=Mode";
+  int hintW = (int)strlen(hint) * 6;
+  display.setCursor((SCREEN_WIDTH - hintW) / 2, 44);
+  display.print(hint);
+
+  // Countdown bar + remaining seconds
+  unsigned long elapsed = millis() - confirmEnterMs;
+  if (elapsed > CONFIRM_TIMEOUT_MS)
+    elapsed = CONFIRM_TIMEOUT_MS;
+  unsigned long remaining = CONFIRM_TIMEOUT_MS - elapsed;
+  int barX = 4;
+  int barY = 56;
+  int barH = 6;
+  int barMaxW = 100;
+  int barW = (int)((long)remaining * barMaxW / CONFIRM_TIMEOUT_MS);
+  // Border around the bar's full width
+  display.drawRect(barX - 1, barY - 1, barMaxW + 2, barH + 2, SSD1306_WHITE);
+  if (barW > 0) {
+    display.fillRect(barX, barY, barW, barH, SSD1306_WHITE);
+  }
+  // Seconds remaining (rounded up, so it shows "10s" -> "0s")
+  int secs = (int)((remaining + 999) / 1000);
+  char secBuf[6];
+  snprintf(secBuf, sizeof(secBuf), "%ds", secs);
+  display.setCursor(SCREEN_WIDTH - (int)strlen(secBuf) * 6 - 2, 56);
+  display.print(secBuf);
 
   display.display();
 }
@@ -1237,35 +1490,43 @@ void refreshDisplay() {
   case MODE_OVERVIEW:
     displayOverview();
     break;
-  case MODE_HISTORY:
-    displayHistory();
-    break;
   case MODE_GRAPH:
     drawGraph(graphShowTemp);
     break;
   case MODE_SETTINGS:
-    if (inTimeEditMode)
+    if (pendingConfirm != CONFIRM_NONE) {
+      displayConfirm();
+    } else if (inTimeEditMode) {
       displayTimeEdit();
-    else
+    } else if (inHistoryView) {
+      displayHistory();
+    } else {
       displaySettings();
+    }
     break;
   default:
     break;
   }
 }
 
+// Encoder rotation: context-dependent navigation.
+// Confirm dialog ignores rotation (Yes/No are picked via the buttons).
 void handleRotation(int delta) {
+  if (pendingConfirm != CONFIRM_NONE) {
+    return;
+  }
+
   switch (currentMode) {
-  case MODE_OVERVIEW:
+  case MODE_OVERVIEW: {
+    int p = (int)currentOverviewPage + delta;
+    p %= OV_PAGE_COUNT;
+    if (p < 0)
+      p += OV_PAGE_COUNT;
+    currentOverviewPage = (OverviewPage)p;
+    Serial.printf("Overview page: %s\n",
+                  currentOverviewPage == OV_CLOCK ? "Clock" : "Default");
     break;
-  case MODE_HISTORY:
-    historyIndex -= delta;
-    if (historyIndex < 0)
-      historyIndex = 0;
-    if (historyIndex >= (int)flashEntryCount)
-      historyIndex = flashEntryCount - 1;
-    Serial.printf("History: %d/%lu\n", historyIndex + 1, flashEntryCount);
-    break;
+  }
   case MODE_GRAPH:
     timeOffset -= delta;
     if (timeOffset < 0)
@@ -1277,6 +1538,13 @@ void handleRotation(int delta) {
   case MODE_SETTINGS:
     if (inTimeEditMode) {
       adjustTimeEditField(delta);
+    } else if (inHistoryView) {
+      historyIndex -= delta;
+      if (historyIndex < 0)
+        historyIndex = 0;
+      if (historyIndex >= (int)flashEntryCount)
+        historyIndex = flashEntryCount - 1;
+      Serial.printf("History: %d/%lu\n", historyIndex + 1, flashEntryCount);
     } else {
       settingsIndex += delta;
       if (settingsIndex < 0)
@@ -1291,18 +1559,15 @@ void handleRotation(int delta) {
   refreshDisplay();
 }
 
+// Encoder click: context action only.
+// Mode cycling moved to the dedicated mode button. This handler also services
+// the Yes branch of the confirmation dialog.
 void handleButtonPress() {
-  // While editing time, short press = next field
-  if (currentMode == MODE_SETTINGS && inTimeEditMode) {
-    timeEditField = (timeEditField + 1) % TE_FIELD_COUNT;
-    refreshDisplay();
-    return;
-  }
-
-  if (currentMode == MODE_SETTINGS) {
-    // Activate the selected settings item
-    switch (settingsIndex) {
-    case SET_NTP_SYNC:
+  if (pendingConfirm != CONFIRM_NONE) {
+    ConfirmAction action = pendingConfirm;
+    pendingConfirm = CONFIRM_NONE;
+    switch (action) {
+    case CONFIRM_NTP_SYNC:
       showStatusMessage("Syncing NTP...");
       if (syncTimeWithNTP()) {
         showStatusMessage("NTP Sync OK!", 20, 28, 1000);
@@ -1310,64 +1575,37 @@ void handleButtonPress() {
         showStatusMessage("NTP Sync Failed", 10, 28, 1000);
       }
       break;
-    case SET_MANUAL_TIME:
-      enterTimeEditMode();
-      break;
-    case SET_SLEEP:
-      sleepTimeoutIdx = (sleepTimeoutIdx + 1) % SLEEP_OPTIONS_COUNT;
-      Serial.printf("Sleep: %s\n", SLEEP_LABELS[sleepTimeoutIdx]);
-      break;
-    case SET_WAKEUP:
-      wakeupIntervalIdx = (wakeupIntervalIdx + 1) % WAKEUP_OPTIONS_COUNT;
-      Serial.printf("Wakeup: %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
-      break;
-    case SET_CLEAR_DATA:
+    case CONFIRM_CLEAR_DATA:
       clearHistory();
       showStatusMessage("Data Cleared!", 10, 28, 800);
-      break;
-    }
-  } else {
-    currentMode = (DisplayMode)((currentMode + 1) % MODE_COUNT);
-
-    switch (currentMode) {
-    case MODE_OVERVIEW:
-      Serial.println("Mode: Overview");
-      break;
-    case MODE_HISTORY:
-      Serial.println("Mode: History");
-      historyIndex = flashEntryCount > 0 ? flashEntryCount - 1 : 0;
-      break;
-    case MODE_GRAPH:
-      Serial.println("Mode: Graph");
-      timeOffset = 0;
-      currentRange = RANGE_DAILY;
-      graphShowTemp = true;
-      break;
-    case MODE_SETTINGS:
-      Serial.println("Mode: Settings");
-      settingsIndex = 0;
-      settingsScroll = 0;
-      inTimeEditMode = false;
       break;
     default:
       break;
     }
+    refreshDisplay();
+    return;
   }
-  refreshDisplay();
-}
 
-void handleLongPress() {
-  // While editing time, long press = save & exit edit (stay in settings)
   if (currentMode == MODE_SETTINGS && inTimeEditMode) {
-    saveTimeEdit();
-    inTimeEditMode = false;
-    showStatusMessage("Time Saved!", 25, 28, 600);
+    timeEditField = (timeEditField + 1) % TE_FIELD_COUNT;
+    refreshDisplay();
+    return;
+  }
+
+  if (currentMode == MODE_SETTINGS && inHistoryView) {
+    inHistoryView = false;
     refreshDisplay();
     return;
   }
 
   switch (currentMode) {
-  case MODE_GRAPH:
+  case MODE_OVERVIEW:
+    // No-op; mode cycling lives on the mode button.
+    break;
+
+  case MODE_GRAPH: {
+    // Cycle 8 combos: Temp Day -> Week -> Month -> Year ->
+    // Humid Day -> Week -> Month -> Year -> wrap.
     if (currentRange == RANGE_YEARLY) {
       currentRange = RANGE_DAILY;
       graphShowTemp = !graphShowTemp;
@@ -1375,20 +1613,111 @@ void handleLongPress() {
       currentRange = (TimeRange)(currentRange + 1);
     }
     timeOffset = 0;
+    static const char *RANGE_NAMES[] = {"Daily", "Weekly", "Monthly", "Yearly"};
     Serial.printf("Graph: %s %s\n", graphShowTemp ? "Temp" : "Humid",
-                  (const char *[]){"Daily", "Weekly", "Monthly",
-                                   "Yearly"}[currentRange]);
+                  RANGE_NAMES[currentRange]);
+    break;
+  }
+
+  case MODE_SETTINGS:
+    switch (settingsIndex) {
+    case SET_NTP_SYNC:
+      pendingConfirm = CONFIRM_NTP_SYNC;
+      confirmEnterMs = millis();
+      lastConfirmRedraw = 0;
+      break;
+    case SET_MANUAL_TIME:
+      enterTimeEditMode();
+      break;
+    case SET_SLEEP:
+      sleepTimeoutIdx = (sleepTimeoutIdx + 1) % SLEEP_OPTIONS_COUNT;
+      Serial.printf("Sleep: %s\n", SLEEP_LABELS[sleepTimeoutIdx]);
+      saveSettings();
+      break;
+    case SET_WAKEUP:
+      wakeupIntervalIdx = (wakeupIntervalIdx + 1) % WAKEUP_OPTIONS_COUNT;
+      Serial.printf("Wakeup: %s\n", WAKEUP_LABELS[wakeupIntervalIdx]);
+      saveSettings();
+      break;
+    case SET_HISTORY:
+      inHistoryView = true;
+      historyIndex = flashEntryCount > 0 ? (int)flashEntryCount - 1 : 0;
+      Serial.println("History view: open");
+      break;
+    case SET_CLEAR_DATA:
+      pendingConfirm = CONFIRM_CLEAR_DATA;
+      confirmEnterMs = millis();
+      lastConfirmRedraw = 0;
+      break;
+    }
+    break;
+
+  default:
+    break;
+  }
+
+  refreshDisplay();
+}
+
+// Encoder long-press: now only used to save and exit time-edit. All other
+// long-press semantics retired when the mode button took over top-level nav.
+void handleLongPress() {
+  if (pendingConfirm != CONFIRM_NONE) {
+    return;
+  }
+  if (currentMode == MODE_SETTINGS && inTimeEditMode) {
+    saveTimeEdit();
+    inTimeEditMode = false;
+    showStatusMessage("Time Saved!", 25, 28, 600);
+    refreshDisplay();
+  }
+}
+
+// Dedicated mode button (GPIO 5) short-press:
+// cycles Overview -> Graph -> Settings -> Overview. Inside a confirm prompt
+// it acts as "No" and dismisses the prompt without cycling.
+void handleModeButtonPress() {
+  if (pendingConfirm != CONFIRM_NONE) {
+    Serial.println("Confirm: cancelled (No)");
+    pendingConfirm = CONFIRM_NONE;
+    refreshDisplay();
+    return;
+  }
+
+  currentMode = (DisplayMode)((currentMode + 1) % MODE_COUNT);
+
+  switch (currentMode) {
+  case MODE_OVERVIEW:
+    Serial.println("Mode: Overview");
+    break;
+  case MODE_GRAPH:
+    Serial.println("Mode: Graph");
+    timeOffset = 0;
+    currentRange = RANGE_DAILY;
+    graphShowTemp = true;
     break;
   case MODE_SETTINGS:
-    saveSettings();
-    Serial.println("Settings saved");
-    showStatusMessage("Settings Saved!", 10, 28, 500);
-    currentMode = MODE_OVERVIEW;
+    Serial.println("Mode: Settings");
+    settingsIndex = 0;
+    settingsScroll = 0;
+    inTimeEditMode = false;
+    inHistoryView = false;
+    pendingConfirm = CONFIRM_NONE;
     break;
   default:
     break;
   }
   refreshDisplay();
+}
+
+// Dedicated mode button long-press: force deep sleep (periodic wake stays
+// armed). Suppressed inside confirm prompts.
+void handleModeLongPress() {
+  if (pendingConfirm != CONFIRM_NONE) {
+    return;
+  }
+  Serial.println("Mode button long-press: forcing sleep");
+  enterDeepSleep(true);
 }
 
 // ========== Setup ==========
@@ -1517,6 +1846,19 @@ void setup() {
 // ========== Loop ==========
 
 void loop() {
+  // Mode button (GPIO 5) handling
+  if (modeLongPress) {
+    modeLongPress = false;
+    handleModeLongPress();
+    lastActivityTime = millis();
+  }
+  if (modeButtonPressed) {
+    modeButtonPressed = false;
+    handleModeButtonPress();
+    lastActivityTime = millis();
+  }
+
+  // Encoder click handling
   if (longPress) {
     longPress = false;
     handleLongPress();
@@ -1548,6 +1890,20 @@ void loop() {
     lastActivityTime = millis();
   }
 
+  // Confirm-prompt tick: redraw the countdown bar and auto-cancel after
+  // CONFIRM_TIMEOUT_MS. Inactivity-sleep timer is NOT reset here.
+  if (pendingConfirm != CONFIRM_NONE) {
+    unsigned long nowMs = millis();
+    if (nowMs - confirmEnterMs >= CONFIRM_TIMEOUT_MS) {
+      Serial.println("Confirm: timed out (No)");
+      pendingConfirm = CONFIRM_NONE;
+      refreshDisplay();
+    } else if (nowMs - lastConfirmRedraw > 200) {
+      lastConfirmRedraw = nowMs;
+      refreshDisplay();
+    }
+  }
+
   // Live sensor + clock updates in overview mode
   if (currentMode == MODE_OVERVIEW) {
     unsigned long nowMs = millis();
@@ -1557,7 +1913,10 @@ void loop() {
       }
       lastLiveUpdate = nowMs;
     }
-    if (nowMs - lastClockRedraw > 1000) {
+    // While the clock page is sliding, refresh ~30 fps; otherwise once a sec.
+    unsigned long redrawInterval =
+        (currentOverviewPage == OV_CLOCK && minuteSliding) ? 33 : 1000;
+    if (nowMs - lastClockRedraw > redrawInterval) {
       displayOverview();
       lastClockRedraw = nowMs;
     }
