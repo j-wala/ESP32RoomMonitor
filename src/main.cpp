@@ -120,6 +120,9 @@ RTC_DATA_ATTR uint32_t flashEntryCount = 0;
 RTC_DATA_ATTR time_t oldestTimestamp = 0;
 RTC_DATA_ATTR time_t newestTimestamp = 0;
 RTC_DATA_ATTR time_t lastNtpSync = 0;
+RTC_DATA_ATTR int32_t cachedWifiChannel = 0;
+RTC_DATA_ATTR uint8_t cachedWifiBssid[6] = {0};
+RTC_DATA_ATTR bool hasCachedWifi = false;
 
 // Global objects
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -193,6 +196,9 @@ unsigned long lastConfirmRedraw = 0;
 int prevMinute = -1;
 unsigned long minuteSlideStart = 0;
 bool minuteSliding = false;
+
+// Suppress non-critical serial output during background wakeups to reduce overhead
+#define LOG(fmt, ...) do { if (!backgroundReading) Serial.printf(fmt, ##__VA_ARGS__); } while(0)
 
 // ========== ISRs ==========
 
@@ -302,9 +308,8 @@ void loadSettings() {
   if (wakeupIntervalIdx < 0 || wakeupIntervalIdx >= WAKEUP_OPTIONS_COUNT)
     wakeupIntervalIdx = 2;
 
-  Serial.printf("Settings loaded: TZ=%s, Sleep=%s, Wakeup=%s\n", TZ_STRING,
-                SLEEP_LABELS[sleepTimeoutIdx],
-                WAKEUP_LABELS[wakeupIntervalIdx]);
+  LOG("Settings loaded: TZ=%s, Sleep=%s, Wakeup=%s\n", TZ_STRING,
+      SLEEP_LABELS[sleepTimeoutIdx], WAKEUP_LABELS[wakeupIntervalIdx]);
 }
 
 void saveSettings() {
@@ -313,9 +318,8 @@ void saveSettings() {
   prefs.putInt("sleepIdx", sleepTimeoutIdx);
   prefs.putInt("wakeupIdx", wakeupIntervalIdx);
   prefs.end();
-  Serial.printf("Settings saved: Sleep=%s, Wakeup=%s\n",
-                SLEEP_LABELS[sleepTimeoutIdx],
-                WAKEUP_LABELS[wakeupIntervalIdx]);
+  LOG("Settings saved: Sleep=%s, Wakeup=%s\n",
+    SLEEP_LABELS[sleepTimeoutIdx], WAKEUP_LABELS[wakeupIntervalIdx]);
 }
 
 void initDisplay() {
@@ -457,68 +461,106 @@ bool syncTimeWithNTP() {
                                          WIFI_PROTOCOL_11N);
   esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
   WiFi.setSleep(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // Low TX power for home use; bumped on retry
 
-  // ---- 3. Scan first to locate the AP on a specific channel/BSSID ----
-  // Use a longer dwell time (500ms/ch) so faint beacons are caught.
-  // This avoids AiMesh band-steering and tells us if the SSID is visible.
-  Serial.printf("Scanning for '%s'...\n", WIFI_SSID);
-  int n = WiFi.scanNetworks(false, true, false, 500); // sync, hidden, active, 500ms/ch
-  int targetIdx = -1;
-  int32_t bestRssi = -127;
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > bestRssi) {
-      bestRssi = WiFi.RSSI(i);
-      targetIdx = i;
+  // ---- 3. PMF (802.11w) + WPA3 SAE config ----
+  // PMF capable-but-not-required fixes WiFi 6 APs that enforce protected frames.
+  // SAE (WPA3) support fixes phone hotspots that default to WPA3 or mixed mode.
+  wifi_config_t sta_cfg = {};
+  strncpy((char *)sta_cfg.sta.ssid, WIFI_SSID, sizeof(sta_cfg.sta.ssid) - 1);
+  strncpy((char *)sta_cfg.sta.password, WIFI_PASSWORD,
+          sizeof(sta_cfg.sta.password) - 1);
+  sta_cfg.sta.pmf_cfg.capable  = true;
+  sta_cfg.sta.pmf_cfg.required = false;
+  sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+  sta_cfg.sta.sae_pwe_h2e        = WPA3_SAE_PWE_BOTH;
+  esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+
+  // ---- 4. Connect: cached BSSID → scan+BSSID → blind retry ----
+  bool wifiConnected = false;
+
+  // Attempt A: use cached channel+BSSID if available — skips the full scan
+  if (hasCachedWifi) {
+    Serial.printf("Trying cached ch%ld %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  cachedWifiChannel,
+                  cachedWifiBssid[0], cachedWifiBssid[1], cachedWifiBssid[2],
+                  cachedWifiBssid[3], cachedWifiBssid[4], cachedWifiBssid[5]);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, (int)cachedWifiChannel, cachedWifiBssid);
+    for (int i = 0; i < 12 && WiFi.status() != WL_CONNECTED; i++) {
+      delay(500);
+      Serial.print(".");
+    }
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (!wifiConnected) {
+      Serial.println("\nCached connect failed, falling back to scan");
+      WiFi.disconnect(false);
+      delay(200);
     }
   }
 
-  // Log nearby networks either way - useful diagnostic
-  Serial.printf("Found %d networks:\n", n);
-  for (int i = 0; i < n && i < 15; i++) {
-    Serial.printf("  %2d: %-32s ch%2d %4d dBm\n", i + 1,
-                  WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
-  }
+  // Attempt B: full scan, pin to best BSSID
+  if (!wifiConnected) {
+    Serial.printf("Scanning for '%s'...\n", WIFI_SSID);
+    int n = WiFi.scanNetworks(false, true, false, 120); // 120ms/ch (was 500ms)
+    int targetIdx = -1;
+    int32_t bestRssi = -127;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > bestRssi) {
+        bestRssi = WiFi.RSSI(i);
+        targetIdx = i;
+      }
+    }
 
-  // ---- 4. Diagnostic: dump SSID + PSK byte-for-byte ----
-  // Detects accidental non-ASCII whitespace, BOM, trailing CR, etc.
-  Serial.printf("SSID len=%u: ", (unsigned)strlen(WIFI_SSID));
-  for (size_t i = 0; i < strlen(WIFI_SSID); i++)
-    Serial.printf("%02X ", (uint8_t)WIFI_SSID[i]);
-  Serial.println();
-  Serial.printf("PSK  len=%u: ", (unsigned)strlen(WIFI_PASSWORD));
-  for (size_t i = 0; i < strlen(WIFI_PASSWORD); i++)
-    Serial.printf("%02X ", (uint8_t)WIFI_PASSWORD[i]);
-  Serial.println();
+    Serial.printf("Found %d networks:\n", n);
+    for (int i = 0; i < n && i < 15; i++) {
+      Serial.printf("  %2d: %-32s ch%2d %4d dBm\n", i + 1,
+                    WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+    }
 
-  // ---- 5. Connect ----
-  if (targetIdx >= 0) {
-    uint8_t *bssid = WiFi.BSSID(targetIdx);
-    int ch = WiFi.channel(targetIdx);
-    Serial.printf("Target on ch%d %d dBm %s - pinning channel+BSSID\n", ch,
-                  WiFi.RSSI(targetIdx), WiFi.BSSIDstr(targetIdx).c_str());
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, ch, bssid);
-  } else {
-    Serial.printf("'%s' NOT in scan results - trying blind connect\n",
-                  WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  }
-  WiFi.scanDelete();
+    // Diagnostic: dump SSID + PSK bytes (detects invisible chars, BOM, CR)
+    Serial.printf("SSID len=%u: ", (unsigned)strlen(WIFI_SSID));
+    for (size_t i = 0; i < strlen(WIFI_SSID); i++)
+      Serial.printf("%02X ", (uint8_t)WIFI_SSID[i]);
+    Serial.println();
+    Serial.printf("PSK  len=%u: ", (unsigned)strlen(WIFI_PASSWORD));
+    for (size_t i = 0; i < strlen(WIFI_PASSWORD); i++)
+      Serial.printf("%02X ", (uint8_t)WIFI_PASSWORD[i]);
+    Serial.println();
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    if (WiFi.status() == WL_CONNECT_FAILED && attempts < 5) {
-      Serial.println("\nConnect failed. Bouncing...");
-      WiFi.disconnect(false); // don't turn radio off
-      delay(500);
+    if (targetIdx >= 0) {
+      uint8_t *bssid = WiFi.BSSID(targetIdx);
+      int ch = WiFi.channel(targetIdx);
+      Serial.printf("Target on ch%d %d dBm %s - pinning\n", ch,
+                    WiFi.RSSI(targetIdx), WiFi.BSSIDstr(targetIdx).c_str());
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD, ch, bssid);
+    } else {
+      Serial.printf("'%s' not found in scan - blind connect\n", WIFI_SSID);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
-    attempts++;
+    WiFi.scanDelete();
+
+    for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) {
+      delay(500);
+      Serial.print(".");
+    }
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
+  // Attempt C: blind connect, max TX power — WiFi 6 band-steering fallback
+  if (!wifiConnected) {
+    Serial.println("\nScan connect failed. Retrying blind, max TX...");
+    WiFi.disconnect(false);
+    delay(300);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+      delay(500);
+      Serial.print(".");
+    }
+    wifiConnected = (WiFi.status() == WL_CONNECTED);
+  }
+
+  if (!wifiConnected) {
     Serial.printf("\nFailed. Final Status: %d\n", WiFi.status());
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -528,6 +570,12 @@ bool syncTimeWithNTP() {
   Serial.printf("\nConnected. IP=%s RSSI=%d dBm CH=%d\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                 WiFi.channel());
+
+  // Cache channel + BSSID for faster connect next time
+  cachedWifiChannel = WiFi.channel();
+  uint8_t *connBssid = WiFi.BSSID();
+  memcpy(cachedWifiBssid, connBssid, 6);
+  hasCachedWifi = true;
 
   // ---- 5. NTP ----
   Serial.println("Syncing NTP...");
@@ -553,11 +601,6 @@ bool syncTimeWithNTP() {
 bool shouldSyncNtp() {
   time_t now = rtc.getEpoch();
 
-  if (backgroundReading) {
-    return true;
-  }
-
-  // Never synced
   if (lastNtpSync == 0 || (now - lastNtpSync > NTP_STALENESS_INTERVAL)) {
     Serial.println("NTP: Never synced or is stale, attempting...");
     return true;
@@ -673,6 +716,13 @@ void initSensor() {
     return;
   }
   sensorAvailable = true;
+  // Forced mode: sensor takes one measurement then sleeps at ~3µA (vs ~1mA normal)
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::FILTER_OFF,
+                  Adafruit_BME280::STANDBY_MS_0_5);
   Serial.println("BME280 OK");
 }
 
@@ -708,8 +758,7 @@ void loadRamBuffer() {
   }
   file.close();
 
-  Serial.printf("Loaded %d entries (total: %lu)\n", ramBufferCount,
-                flashEntryCount);
+  LOG("Loaded %d entries (total: %lu)\n", ramBufferCount, flashEntryCount);
 }
 
 void logReading(const SensorData &data) {
@@ -737,7 +786,7 @@ void logReading(const SensorData &data) {
     if (flashEntryCount == 1)
       oldestTimestamp = data.timestamp;
 
-    Serial.printf("Logged #%lu\n", flashEntryCount);
+    LOG("Logged #%lu\n", flashEntryCount);
   } else {
     Serial.println("Failed to open history file");
   }
@@ -771,6 +820,7 @@ void readAndLogSensor() {
   }
 
   SensorData data;
+  bme.takeForcedMeasurement();
   data.temperature = bme.readTemperature();
   data.humidity = bme.readHumidity();
   data.pressure = bme.readPressure() / 100.0F;
@@ -778,17 +828,15 @@ void readAndLogSensor() {
 
   logReading(data);
 
-  Serial.println("=== Reading ===");
-  Serial.printf("T: %.1f C  H: %.0f%%  P: %.0fhPa\n", data.temperature,
-                data.humidity, data.pressure);
-  Serial.printf("Time: %s\n", rtc.getTime("%H:%M:%S").c_str());
-  Serial.printf("Entries: %lu (RAM: %d)\n", flashEntryCount, ramBufferCount);
-  Serial.println("===============");
+  LOG("=== Reading ===\nT: %.1f C  H: %.0f%%  P: %.0fhPa  Time: %s  Entries: %lu\n",
+      data.temperature, data.humidity, data.pressure,
+      rtc.getTime("%H:%M:%S").c_str(), flashEntryCount);
 }
 
 bool readSensorLive(SensorData &out) {
   if (!sensorAvailable)
     return false;
+  bme.takeForcedMeasurement();
   out.temperature = bme.readTemperature();
   out.humidity = bme.readHumidity();
   out.pressure = bme.readPressure() / 100.0F;
@@ -1723,13 +1771,20 @@ void handleModeLongPress() {
 // ========== Setup ==========
 
 void setup() {
+  // Determine wakeup cause before any delay so we can gate the USB stall
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
   Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT
-  delay(2000); // Give USB time to reconnect
-  Serial.flush();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    delay(2000); // Only wait for USB enumeration on cold boot / hard reset
+    Serial.flush();
+  }
 #else
   delay(100);
 #endif
+
+  setCpuFrequencyMhz(80); // Reduce from default 160MHz; saves ~25% active power
 
   // Apply timezone from POSIX TZ string. All localtime_r() / mktime() calls
   // and Arduino's getLocalTime() will use this to compute local time with DST.
@@ -1742,8 +1797,6 @@ void setup() {
 
   bootCount++;
   Serial.printf("Boot: %d  CPU: %dMHz\n\n", bootCount, getCpuFrequencyMhz());
-
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
   switch (wakeup_reason) {
   case ESP_SLEEP_WAKEUP_GPIO:
@@ -1823,7 +1876,11 @@ void setup() {
 
   initSensor();
 
-  loadRamBuffer();
+  if (backgroundReading) {
+    setCpuFrequencyMhz(40); // Minimal clock for sensor read + flash write
+  } else {
+    loadRamBuffer(); // RAM buffer only needed for interactive display/graphing
+  }
 
   readAndLogSensor();
 
